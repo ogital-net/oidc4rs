@@ -154,3 +154,57 @@ impl AsRef<Url> for RedirectUrl {
         &self.0
     }
 }
+
+/// Redirect URI used after RP-initiated logout (OIDC RP-Initiated
+/// Logout 1.0 section 2.1). The `post_logout_redirect_uri` parameter
+/// on the end-session request must be one of the URIs the RP
+/// pre-registered with the OP.
+///
+/// Custom schemes are permitted for native apps, so we do not
+/// enforce `https` here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PostLogoutRedirectUrl(Url);
+
+impl PostLogoutRedirectUrl {
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for PostLogoutRedirectUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for PostLogoutRedirectUrl {
+    type Err = OidcError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let url = Url::parse(s).map_err(|e| OidcError::InvalidUrl(e.to_string()))?;
+        Ok(Self(url))
+    }
+}
+
+impl Serialize for PostLogoutRedirectUrl {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PostLogoutRedirectUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl AsRef<Url> for PostLogoutRedirectUrl {
+    fn as_ref(&self) -> &Url {
+        &self.0
+    }
+}

@@ -223,8 +223,8 @@ children once their parent is done.
 - [ ] `flow::callback::parse_authorization_response` auto-detects leading `?` / `#` so callers do not strip (see section 9.9)
 - [x] `flow::token::CodeTokenRequest` (Basic + body auth, PKCE verifier)
 - [x] `flow::token::RefreshTokenRequest`
-- [ ] `flow::logout` -- expose `Client::build_end_session_url` wrapping `EndSessionUrlBuilder` (see section 9.7)
-- [ ] `flow::logout::EndSessionUrlBuilder` -- add `client_id`, `logout_hint`, `ui_locales` (see section 9.7)
+- [x] `flow::logout` -- expose `Client::build_end_session_url` wrapping `EndSessionUrlBuilder` (see section 9.7)
+- [x] `flow::logout::EndSessionUrlBuilder` -- add `client_id`, `logout_hint`, `ui_locales` (see section 9.7)
 - [x] `Client::complete_authorization` second-leg helper
 - [x] `Client::exchange_refresh_token`
 
@@ -246,7 +246,7 @@ children once their parent is done.
 - [ ] `examples/authorization_code_multi_instance.rs` (with in-memory KV adapter)
 - [ ] `examples/reqwest_adapter.rs` showing the HTTP / KV trait impls
 - [ ] `examples/refresh_token.rs`
-- [ ] `examples/logout.rs`
+- [x] `examples/logout.rs`
 - [ ] `examples/custom_claims.rs`
 - [ ] Top-level `README.md` with quickstart
 
@@ -336,13 +336,13 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 
 | Feature | Status | Notes |
 |---|---|---|
-| RP-initiated logout URL builder | Partial | `EndSessionUrlBuilder` exists but is **not exposed as a `Client` method**; SPEC §8.7 promises `build_end_session_url` |
+| RP-initiated logout URL builder | Already | `Client::build_end_session_url()` returns `EndSessionUrlBuilder` |
 | `id_token_hint` | Already | builder |
-| `post_logout_redirect_uri` | Already | builder |
-| `state` | Already | builder |
-| `client_id` | Add | openidconnect-rs has |
-| `logout_hint` | Add | openidconnect-rs has |
-| `ui_locales` (repeated) | Add | openidconnect-rs has |
+| `post_logout_redirect_uri` | Already | builder; typed `PostLogoutRedirectUrl` |
+| `state` | Already | builder; auto-generated when `post_logout_redirect_uri` is set |
+| `client_id` | Already | builder |
+| `logout_hint` | Already | builder; typed `LogoutHint` |
+| `ui_locales` (repeated) | Already | builder; `add_ui_locale` joins with space |
 | Backchannel logout (RP) | Defer | Spec section 2 |
 | Front-channel logout (RP) | Defer | Spec section 2 (browser iframe is the OP's job; we do not deliver frames) |
 
@@ -398,9 +398,12 @@ by impact and dependency order:
    with `openidconnect-rs`.
 2. **`Client::build_end_session_url`** wrapping the existing
    `EndSessionUrlBuilder`. Required for SPEC §8.7 conformance and
-   the logout example.
+   the logout example. (Done -- returns the builder directly, no
+   intermediate wrapper.)
 3. **Logout extension params** (`client_id`, `logout_hint`,
-   `ui_locales`) added to the builder.
+   `ui_locales`) added to the builder. (Done -- typed `LogoutHint`
+   and `PostLogoutRedirectUrl` newtypes; `add_ui_locale` is
+   repeatable and joins with space per OIDC Core 2.0.)
 4. **Auth-request extension params** (`display`, `claims_locales`)
    added to the builder.
 5. **Constant-time nonce comparison** in `IdTokenVerifier`. See

@@ -255,6 +255,22 @@ impl Client {
             Some(method),
         ))
     }
+
+    /// Begins building an RP-initiated logout URL (OIDC RP-Initiated
+    /// Logout 1.0). The returned
+    /// [`EndSessionUrlBuilder`](crate::flow::logout::EndSessionUrlBuilder)
+    /// accepts the standard parameters (`id_token_hint`,
+    /// `post_logout_redirect_uri`, `state`, `client_id`,
+    /// `logout_hint`, `ui_locales`).
+    ///
+    /// `build()` returns the URL plus the `state` value the OP will
+    /// echo back (or `None` if neither `state` nor
+    /// `post_logout_redirect_uri` were set). Errors if the OP did not
+    /// advertise an `end_session_endpoint` in its discovery
+    /// document.
+    pub fn build_end_session_url(&self) -> crate::flow::logout::EndSessionUrlBuilder<'_> {
+        crate::flow::logout::EndSessionUrlBuilder::new(self)
+    }
 }
 
 /// Result of [`Client::complete_authorization`].

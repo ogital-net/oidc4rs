@@ -319,6 +319,18 @@ impl AsRef<str> for RefreshToken {
     }
 }
 
+nonempty_string_newtype!(
+    /// Hint to the OP about which end-user is logging out
+    /// (OIDC RP-Initiated Logout 1.0 section 2.1).
+    ///
+    /// The OP is free to interpret the value; the spec does not
+    /// require any particular encoding. Callers that want to send a
+    /// known-stable user identifier (e.g. login name, email) wrap
+    /// it here so the wire parameter is type-safe at the Rust
+    /// boundary.
+    LogoutHint
+);
+
 /// Generates a url-safe base64 (no padding) string from `n` random bytes.
 fn random_url_safe(n: usize) -> String {
     use base64::Engine;
