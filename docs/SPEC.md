@@ -151,6 +151,12 @@ ID-token verification (in `token::verify::IdTokenVerifier::verify`):
 | JWKS `kid` lookup | `jose4rs::jwk::VerificationJwkSelector` |
 | JWKS refresh on unknown `kid` | `jose4rs::jwk::AsyncHttpsJwks` |
 
+Nonce comparison is performed via constant-time equality on the
+SHA-256 digests of the two strings (rather than the strings
+themselves) to defeat timing oracles that recover the secret
+byte-by-byte. The convention follows `openidconnect-rs`; the secret
+being compared is the cryptographic nonce, not user input.
+
 ## 6. HTTP / KV Transport
 
 Both are traits with `BoxFuture<'_, T>` returns. The crate ships no
@@ -209,19 +215,27 @@ children once their parent is done.
 - [x] `client::Client::discover` end-to-end
 - [x] `client::Client::from_parts` for manual setup
 - [x] `flow::authorize::AuthorizeUrlBuilder` (scope, prompt, max_age, acr, login_hint, ui_locales, PKCE, extra params)
+- [ ] `flow::authorize::AuthorizeUrlBuilder` -- add `display`, `claims_locales` (parity with `temp/openid` and `temp/openidconnect-rs`; see section 9.1)
 - [x] `flow::callback::parse_authorization_response` (query and fragment modes)
+- [ ] `flow::callback::parse_authorization_response` auto-detects leading `?` / `#` so callers do not strip (see section 9.9)
 - [x] `flow::token::CodeTokenRequest` (Basic + body auth, PKCE verifier)
 - [x] `flow::token::RefreshTokenRequest`
-- [x] `flow::logout::build_end_session_url` (id_token_hint, post_logout_redirect_uri, state)
+- [ ] `flow::logout` -- expose `Client::build_end_session_url` wrapping `EndSessionUrlBuilder` (see section 9.7)
+- [ ] `flow::logout::EndSessionUrlBuilder` -- add `client_id`, `logout_hint`, `ui_locales` (see section 9.7)
 - [x] `Client::complete_authorization` second-leg helper
 - [x] `Client::exchange_refresh_token`
 
 ### 8.8 Token verification
 
 - [x] `token::verify::IdTokenVerifier` with all checks in section 5
+- [ ] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via SHA-256 digests (see section 5 footnote)
+- [ ] `Client::discover` / `Client::from_parts` -- auto-narrow `IdTokenVerifier::allowed_algs` from `metadata.id_token_signing_alg_values_supported`; expose `Client::verifier()`
 - [x] `token::response::TokenResponse` with `AccessToken`, `RefreshToken`, `IdToken`
+- [ ] `token::response::TokenResponse` -- record `expires_in` as `Option<Instant>` for downstream refresh logic
 - [x] `token::userinfo::UserInfo` with signed-JWT body support
 - [x] `Client::fetch_userinfo` with `Accept: application/json, application/jwt;q=0.9` and Content-Type dispatch
+- [ ] `Client::fetch_userinfo` -- assert `sub` matches the verified ID token when supplied (see section 9.5)
+- [ ] `claims::OidcClaims` -- `AdditionalClaims` trait so callers can decode typed custom fields (see section 9.8)
 
 ### 8.9 Examples and docs
 
@@ -238,3 +252,181 @@ children once their parent is done.
 - [x] Unit tests for all wrapper functions
 - [ ] Integration test against a mock OIDC server (e.g. `oidc-testprovider` from mozilla-django-oidc) behind a feature flag
 - [ ] Snapshot tests for `parse_authorization_response`
+
+## 9. Parity Status (vs. `temp/openid` and `temp/openidconnect-rs`)
+
+Two reference clones were audited in 2026-08 against this spec.
+Items below classify the gaps as **Add** (work pending for v1.1),
+**Defer** (intentionally out of scope per section 2), or **Already**
+(present).
+
+### 9.1 Authorization request parameters
+
+| Parameter | Status | Notes |
+|---|---|---|
+| `scope` (must include `openid`) | Already | `Client::authorize` enforces |
+| `state`, `nonce` | Already | Random, persisted in `AuthRequestState` |
+| PKCE S256 | Already | `AuthorizeUrlBuilder::pkce_s256` |
+| `prompt` | Already | `AuthPrompt` enum (None/Login/Consent/SelectAccount) |
+| `max_age` | Already | `Duration` |
+| `id_token_hint` | Already | builder method |
+| `login_hint` | Already | builder method |
+| `acr_values` | Already | builder method |
+| `ui_locales` | Already | builder method |
+| `response_mode` (Query/Fragment/FormPost) | Already | enum |
+| `claims_locales` | Add | Both clones support; builder has no method |
+| `display` (page/popup/touch/wap) | Add | Both clones support; not in v1 builder |
+| Extra params | Already | `extra_param` covers JAR-style `request` and PAR-style `request_uri` |
+
+### 9.2 Token request
+
+| Feature | Status | Notes |
+|---|---|---|
+| Authorization-code exchange | Already | `Client::exchange_code` + `CodeTokenRequest` |
+| Refresh-token exchange | Already | `Client::exchange_refresh_token` + `RefreshTokenRequest` |
+| Basic and body client auth | Already | `TokenAuthMethod::from_metadata` |
+| PKCE verifier on the wire | Already | wired through `complete_authorization` |
+| ROPC / Client Credentials / Device Code | Defer | Spec section 2 |
+| Token Exchange (RFC 8693) | Defer | Spec section 2 |
+
+### 9.3 Token response
+
+| Feature | Status | Notes |
+|---|---|---|
+| `access_token`, `refresh_token`, `id_token` parsing | Already | `TokenResponse` |
+| `expires_in` / clock-skewed expiry tracking | Add | openid has `TemporalBearerGuard`; we ignore `expires_in` after parse |
+| `auto-refresh` helper (`ensure_token`) | Defer | Convenience, not protocol |
+
+### 9.4 ID-token verification
+
+| Feature | Status | Notes |
+|---|---|---|
+| All SPEC section 5 checks | Already | Single call site in `IdTokenVerifier::verify` |
+| JWKS kid refresh on miss | Already | `AsyncHttpsJwks::select_verification_key` |
+| Constant-time nonce compare | Add | See section 5 footnote; currently `==` |
+| Algorithm allow-list seeded from discovery | Add | openidconnect-rs threads `id_token_signing_alg_values_supported`; we default to the full Core set |
+| Insecure verify (skip signature) | Defer | OpenSSF discourages; documentation only |
+
+### 9.5 UserInfo
+
+| Feature | Status | Notes |
+|---|---|---|
+| JSON body | Already | `UserInfo::from_json` |
+| Signed-JWT body | Already | `UserInfo::from_signed_jwt` |
+| `Accept` negotiation (`application/json, application/jwt;q=0.9`) | Already | `Client::fetch_userinfo` |
+| `sub` mismatch with ID token | Add | openid has `Userinfo::MismatchSubject` |
+| Custom claim decoding into typed structs | Add | See section 9.8 |
+
+### 9.6 Discovery
+
+| Feature | Status | Notes |
+|---|---|---|
+| Standard fields (`ProviderMetadata`) | Already | `metadata::ProviderMetadata` |
+| Issuer equality check | Already | `metadata::discover` |
+| JWKS fetch | Already | `AsyncHttpsJwks` |
+| Forward-compatible unknown-field capture | Already | `extra: serde_json::Map` flatten |
+| `AdditionalProviderMetadata` trait | Add | openidconnect-rs has; we keep the flat map |
+| JWKS TTL / refresh hint caching | Already | `AsyncHttpsJwks` honors `cache-control` |
+| `IssuerUrl::join(".well-known/openid-configuration")` | Already | `metadata::discover` does it |
+
+### 9.7 Logout
+
+| Feature | Status | Notes |
+|---|---|---|
+| RP-initiated logout URL builder | Partial | `EndSessionUrlBuilder` exists but is **not exposed as a `Client` method**; SPEC §8.7 promises `build_end_session_url` |
+| `id_token_hint` | Already | builder |
+| `post_logout_redirect_uri` | Already | builder |
+| `state` | Already | builder |
+| `client_id` | Add | openidconnect-rs has |
+| `logout_hint` | Add | openidconnect-rs has |
+| `ui_locales` (repeated) | Add | openidconnect-rs has |
+| Backchannel logout (RP) | Defer | Spec section 2 |
+| Front-channel logout (RP) | Defer | Spec section 2 (browser iframe is the OP's job; we do not deliver frames) |
+
+### 9.8 Custom claims (extension surface)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Extra fields on `UserInfo` | Already | `UserInfo.extra: HashMap<String, Value>` |
+| Extra fields on ID-token claims | Add | openid has `CustomClaims` trait; openidconnect-rs has `AdditionalClaims`. SPEC §8.6 only covers typed accessors, not extension fields |
+| Custom token response fields | Already | `TokenResponse` round-trips unknown keys via `extra` flatten |
+
+### 9.9 Callback parsing
+
+| Feature | Status | Notes |
+|---|---|---|
+| `code` / `state` / `iss` | Already | `parse_authorization_response` |
+| `error` / `error_description` | Already | `CallbackError::ProviderError` |
+| Auto-detect query vs fragment at the string level | Add | Both clones accept either; we require the caller to strip the leading `?`/`#` |
+| Snapshot tests | Add | SPEC §8.10 already calls this out |
+
+### 9.10 Transport and crypto
+
+| Feature | Status | Notes |
+|---|---|---|
+| `AsyncHttpClient` trait | Already | `transport::http` |
+| `AsyncKvStore` trait | Already | `transport::kv` |
+| Examples wiring reqwest + Redis-like adapters | Partial | SPEC §8.9 pending |
+| Direct FFI to aws-lc / boring, no `ring`/`sha2`/`rand_core` in public types | Already | Unique to oidc4rs |
+
+### 9.11 Error model
+
+| Feature | Status | Notes |
+|---|---|---|
+| Single crate-wide `OidcError` | Already | openidconnect-rs has 5+ per-feature enums; we have one |
+| `From<jose4rs::error::JoseError>` and `From<InvalidJwtError>` | Already | wired in `error.rs` |
+
+### 9.12 Testing
+
+| Feature | Status | Notes |
+|---|---|---|
+| Unit tests for all wrapper functions | Already | 43 tests passing on both backends |
+| Integration test against a mock OP | Add | SPEC §8.10 calls this out |
+| Snapshot tests for callback parsing | Add | SPEC §8.10 |
+
+## 10. v1.1 Roadmap (post-1.0)
+
+Items marked **Add** in section 9 are candidates. Ordered roughly
+by impact and dependency order:
+
+1. **Custom claims trait** (`AdditionalClaims`). Pairs with
+   `IdTokenVerifier::verify` returning a typed `IdTokenClaims<AC>`
+   instead of bare `JwtClaims`. Closes the largest ergonomic gap
+   with `openidconnect-rs`.
+2. **`Client::build_end_session_url`** wrapping the existing
+   `EndSessionUrlBuilder`. Required for SPEC §8.7 conformance and
+   the logout example.
+3. **Logout extension params** (`client_id`, `logout_hint`,
+   `ui_locales`) added to the builder.
+4. **Auth-request extension params** (`display`, `claims_locales`)
+   added to the builder.
+5. **Constant-time nonce comparison** in `IdTokenVerifier`. See
+   section 5 footnote.
+6. **Auto-`sub` check** in `Client::fetch_userinfo`: compare the
+   `sub` claim against the ID-token's `sub` when a verifier is
+   supplied.
+7. **Algorithm allow-list from discovery**: `Client::discover`
+   auto-narrows `IdTokenVerifier::allowed_algs` to
+   `metadata.id_token_signing_alg_values_supported`. New convenience
+   constructor `Client::verifier()` that returns the narrowed
+   verifier.
+8. **`parse_authorization_response`** accepts either a query string
+   or a leading-`#`-stripped fragment unchanged. SPEC §8.10
+   snapshot tests added at the same time.
+9. **Examples** (SPEC §8.9) and **integration tests** (SPEC §8.10).
+   Pulled from the same reference clones so the examples double as
+   compatibility documentation.
+10. **`expires_in` parsing**: `TokenResponse` records expiry as
+    `Option<Instant>`; `TemporalBearerGuard`-style convenience is
+    deferred until requested.
+
+## 11. Open Questions
+
+- Mock OP for integration tests: pure-Rust (`wiremock` + `axum`,
+  CI stays Rust-only) vs Python `oidc-testprovider`. Same question
+  as in [oidc4rs-roadmap-2026-08.md](../memories/repo/oidc4rs-roadmap-2026-08.md).
+- Should `AdditionalClaims` be required or optional at the API
+  level? `openidconnect-rs` uses a 17-parameter typestate; we
+  prefer one generic on `IdTokenClaims<AC>` to keep `Client`
+  unparameterized.
+- Snapshot tests: `insta` (dev-dep) vs hand-rolled string compare.
