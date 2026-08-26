@@ -256,6 +256,28 @@ impl Client {
         ))
     }
 
+    /// Builds an [`IdTokenVerifier`](crate::token::verify::IdTokenVerifier)
+    /// pre-wired for this relying party:
+    /// - `expected_issuer` is taken from the discovery document.
+    /// - `expected_audience` is `self.client_id().as_str()`.
+    /// - The `allowed_algs` list is narrowed to whatever the OP
+    ///   advertised in `id_token_signing_alg_values_supported`, so
+    ///   the verifier cannot be tricked into accepting a `none` or
+    ///   weaker algorithm the OP has stopped using. When the field
+    ///   is absent, the verifier falls back to the OIDC Core 1.0
+    ///   default `id_token` `alg` set.
+    ///
+    /// Callers can further narrow or widen the list with
+    /// `IdTokenVerifier::allow_alg` /
+    /// `IdTokenVerifier::with_allowed_algs` before passing the
+    /// verifier to `verify` / `verify_id_token`.
+    pub fn verifier(&self) -> crate::token::verify::IdTokenVerifier {
+        crate::token::verify::IdTokenVerifier::from_metadata(
+            self.metadata(),
+            self.client_id().as_str(),
+        )
+    }
+
     /// Begins building an RP-initiated logout URL (OIDC RP-Initiated
     /// Logout 1.0). The returned
     /// [`EndSessionUrlBuilder`](crate::flow::logout::EndSessionUrlBuilder)

@@ -20,6 +20,7 @@ use jose4rs::jws::{AlgorithmIdentifier, JsonWebSignature};
 use jose4rs::jwt::{JwtClaims, JwtConsumerBuilder};
 
 use crate::error::OidcError;
+use crate::metadata::ProviderMetadata;
 use crate::token::response::IdToken;
 
 /// Context the caller supplies per verification.
@@ -37,6 +38,16 @@ pub struct VerifyContext {
     pub clock_skew: Option<Duration>,
 }
 
+/// The default algorithm allow-list used when the OP does not
+/// advertise `id_token_signing_alg_values_supported` in its discovery
+/// document. Mirrors the OIDC Core 1.0 JWS `alg` set the spec
+/// guarantees for `id_token`s: RS/PS/ES families plus EdDSA.
+/// HS* are deliberately excluded because symmetric algorithms
+/// require a shared secret distribution the RP cannot assume.
+pub const DEFAULT_ALLOWED_ALGS: &[&str] = &[
+    "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA",
+];
+
 /// Configured verifier. Constructed once per relying-party, then
 /// reused for every callback.
 pub struct IdTokenVerifier {
@@ -46,22 +57,60 @@ pub struct IdTokenVerifier {
 }
 
 impl IdTokenVerifier {
+    /// Builds a verifier with the OIDC Core 1.0 default
+    /// `id_token` allow-list. Use [`IdTokenVerifier::from_metadata`]
+    /// when the relying party has access to a discovery document;
+    /// it narrows the list to the algorithms the OP actually
+    /// advertises.
     pub fn new(expected_issuer: impl Into<String>, expected_audience: impl Into<String>) -> Self {
         Self {
             expected_issuer: expected_issuer.into(),
             expected_audience: expected_audience.into(),
-            allowed_algs: vec![
-                "RS256".into(),
-                "RS384".into(),
-                "RS512".into(),
-                "ES256".into(),
-                "ES384".into(),
-                "ES512".into(),
-                "PS256".into(),
-                "PS384".into(),
-                "PS512".into(),
-                "EdDSA".into(),
-            ],
+            allowed_algs: DEFAULT_ALLOWED_ALGS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        }
+    }
+
+    /// Builds a verifier whose allow-list is sourced from the OP's
+    /// discovery document, closing the algorithm-confusion gap that
+    /// comes from a default-permissive verifier accepting any Core
+    /// `alg` the OP happens to rotate to.
+    ///
+    /// Precedence:
+    /// - `metadata.id_token_signing_alg_values_supported = Some(vec)`
+    ///   -> verifier accepts only those algs (possibly empty if the
+    ///   OP advertised nothing, in which case every ID token is
+    ///   rejected; this matches `openidconnect-rs`).
+    /// - `metadata.id_token_signing_alg_values_supported = None` ->
+    ///   fallback to [`DEFAULT_ALLOWED_ALGS`].
+    ///
+    /// `audience` is the relying party's client id (the `aud` value
+    /// the OP is expected to put in the ID token).
+    ///
+    /// The expected issuer is the `metadata.issuer` value with any
+    /// trailing slash stripped, so the verifier compares against the
+    /// exact string the OP writes in the `iss` claim. OIDC Core
+    /// 1.0 §2 requires those two values to match byte-for-byte, and
+    /// `url` normalizes a host-only origin like
+    /// `https://idp.example.com` to the slash form
+    /// `https://idp.example.com/`, which would otherwise cause
+    /// `JwtConsumer` to reject a well-formed token.
+    pub fn from_metadata(metadata: &ProviderMetadata, audience: impl Into<String>) -> Self {
+        let default_algs: Vec<String> = DEFAULT_ALLOWED_ALGS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let allowed = metadata
+            .id_token_signing_alg_values_supported
+            .clone()
+            .map_or(default_algs, |algs| algs.into_iter().collect());
+        let issuer = strip_trailing_slash(metadata.issuer.as_url().as_str());
+        Self {
+            expected_issuer: issuer.to_owned(),
+            expected_audience: audience.into(),
+            allowed_algs: allowed,
         }
     }
 
@@ -81,6 +130,13 @@ impl IdTokenVerifier {
 
     pub fn audience(&self) -> &str {
         &self.expected_audience
+    }
+
+    /// Returns the configured allow-list as a borrowed slice of
+    /// `String`. Intended for inspection and tests; the verifier
+    /// itself owns the canonical list.
+    pub fn allowed_algs(&self) -> &[String] {
+        &self.allowed_algs
     }
 
     /// Verifies `token` end-to-end. Looks the signing key up in
@@ -246,14 +302,25 @@ fn check_at_hash(
     Ok(())
 }
 
+/// Strips a single trailing `/` from `s` so a parsed-then-serialized
+/// host-only origin like `https://idp.example.com/` compares
+/// byte-equal to the slash-less form the OP writes in its `iss`
+/// claim. Returns `s` unchanged otherwise.
+fn strip_trailing_slash(s: &str) -> &str {
+    s.strip_suffix('/').unwrap_or(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::ProviderMetadata;
+    use crate::types::{AuthUrl, IssuerUrl, JwksUrl, TokenUrl};
     use jose4rs::jwk::{AsyncJwksFetcher, FetchResponse, JsonWebKey, JsonWebKeySet};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
     use serde_json::json;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     const KID: &str = "test-key-1";
@@ -544,5 +611,96 @@ mod tests {
         };
         let err = verifier().verify(&token, &jwks, &ctx).await.unwrap_err();
         assert!(matches!(err, OidcError::AtHashMismatch));
+    }
+
+    fn metadata_with_algs(algs: Option<Vec<String>>) -> ProviderMetadata {
+        ProviderMetadata {
+            issuer: IssuerUrl::from_str("https://idp.example.com").unwrap(),
+            authorization_endpoint: AuthUrl::from_str("https://idp.example.com/authorize").unwrap(),
+            token_endpoint: TokenUrl::from_str("https://idp.example.com/token").unwrap(),
+            userinfo_endpoint: None,
+            jwks_uri: JwksUrl::from_str("https://idp.example.com/jwks").unwrap(),
+            end_session_endpoint: None,
+            registration_endpoint: None,
+            scopes_supported: None,
+            response_types_supported: vec!["code".into()],
+            subject_types_supported: None,
+            id_token_signing_alg_values_supported: algs,
+            grant_types_supported: None,
+            token_endpoint_auth_methods_supported: None,
+            userinfo_signing_alg_values_supported: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn from_metadata_narrows_to_advertised_subset() {
+        let meta = metadata_with_algs(Some(vec!["RS256".into(), "ES256".into()]));
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ES256".to_owned()]);
+        // OIDC Core §2 requires the `iss` claim to match the issuer
+        // URL the OP advertises; we strip the slash that `url`
+        // appends so the verifier compares byte-equal to the OP.
+        assert_eq!(v.issuer(), "https://idp.example.com");
+        assert_eq!(v.audience(), "my-client");
+    }
+
+    #[test]
+    fn from_metadata_preserves_issuer_with_path() {
+        let meta = metadata_with_algs(Some(vec!["RS256".into()]));
+        // Issuer with a non-trivial path -- no slash stripping needed.
+        let meta = ProviderMetadata {
+            issuer: IssuerUrl::from_str("https://idp.example.com/op").unwrap(),
+            ..meta
+        };
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        assert_eq!(v.issuer(), "https://idp.example.com/op");
+    }
+
+    #[test]
+    fn from_metadata_strips_trailing_slash_from_already_slashed_issuer() {
+        let meta = metadata_with_algs(Some(vec!["RS256".into()]));
+        let meta = ProviderMetadata {
+            issuer: IssuerUrl::from_str("https://idp.example.com/").unwrap(),
+            ..meta
+        };
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        // Idempotent: an issuer that already has a trailing slash
+        // loses it once, not repeatedly.
+        assert_eq!(v.issuer(), "https://idp.example.com");
+    }
+
+    #[test]
+    fn from_metadata_falls_back_to_core_default_when_field_absent() {
+        let meta = metadata_with_algs(None);
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        let expected: Vec<String> = DEFAULT_ALLOWED_ALGS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(v.allowed_algs(), expected.as_slice());
+    }
+
+    #[test]
+    fn from_metadata_preserves_op_advertised_empty_list() {
+        // Some(empty) means the OP explicitly advertised nothing;
+        // honor that as "reject every alg" so a misconfigured OP
+        // surfaces as a hard verification failure rather than
+        // silently passing.
+        let meta = metadata_with_algs(Some(vec![]));
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        assert!(v.allowed_algs().is_empty());
+    }
+
+    #[test]
+    fn from_metadata_keeps_unknown_alg_strings_verbatim() {
+        // OPs can advertise algs jose4rs does not recognize; the
+        // allow-list is opaque strings, so we do not validate each
+        // entry against the jose4rs enum. The downstream
+        // `AlgorithmIdentifier::try_from` in `check_alg` is what
+        // surfaces an unsupported alg to the caller.
+        let meta = metadata_with_algs(Some(vec!["RS256".into(), "ZZ999".into()]));
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ZZ999".to_owned()]);
     }
 }

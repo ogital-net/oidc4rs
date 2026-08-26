@@ -232,7 +232,7 @@ children once their parent is done.
 
 - [x] `token::verify::IdTokenVerifier` with all checks in section 5
 - [x] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via `CRYPTO_memcmp` (see section 5 footnote)
-- [ ] `Client::discover` / `Client::from_parts` -- auto-narrow `IdTokenVerifier::allowed_algs` from `metadata.id_token_signing_alg_values_supported`; expose `Client::verifier()`
+- [x] `IdTokenVerifier::from_metadata` narrows `allowed_algs` from `metadata.id_token_signing_alg_values_supported`; `Client::verifier()` is the convenience constructor (issuer from discovery, audience from `client_id`, trailing slash stripped from issuer so it compares byte-equal to the OP's `iss` claim)
 - [x] `token::response::TokenResponse` with `AccessToken`, `RefreshToken`, `IdToken`
 - [ ] `token::response::TokenResponse` -- record `expires_in` as `Option<Instant>` for downstream refresh logic
 - [x] `token::userinfo::UserInfo` with signed-JWT body support
@@ -307,7 +307,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 | All SPEC section 5 checks | Already | Single call site in `IdTokenVerifier::verify` |
 | JWKS kid refresh on miss | Already | `AsyncHttpsJwks::select_verification_key` |
 | Constant-time nonce compare | Already | `crypto::ct::ct_equals` wrapping `CRYPTO_memcmp`; called from `check_nonce` |
-| Algorithm allow-list seeded from discovery | Add | openidconnect-rs threads `id_token_signing_alg_values_supported`; we default to the full Core set |
+| Algorithm allow-list seeded from discovery | Already | `IdTokenVerifier::from_metadata` and `Client::verifier()` thread `metadata.id_token_signing_alg_values_supported`; `Some(empty)` is honored as "reject all" to surface misconfigured OPs loudly; `None` falls back to the OIDC Core default `id_token` `alg` set |
 | Insecure verify (skip signature) | Defer | OpenSSF discourages; documentation only |
 
 ### 9.5 UserInfo
@@ -383,7 +383,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 
 | Feature | Status | Notes |
 |---|---|---|
-| Unit tests for all wrapper functions | Already | 43 tests passing on both backends |
+| Unit tests for all wrapper functions | Already | 77 tests passing on both backends |
 | Integration test against a mock OP | Add | SPEC §8.10 calls this out |
 | Snapshot tests for callback parsing | Add | SPEC §8.10 |
 
@@ -416,7 +416,12 @@ by impact and dependency order:
    auto-narrows `IdTokenVerifier::allowed_algs` to
    `metadata.id_token_signing_alg_values_supported`. New convenience
    constructor `Client::verifier()` that returns the narrowed
-   verifier.
+   verifier. (Done -- `IdTokenVerifier::from_metadata` plus
+   `Client::verifier`; issuer pulled from discovery with the
+   trailing slash stripped so it byte-matches the OP's `iss`
+   claim; `Some(empty)` is honored as "reject every alg" to
+   surface a misconfigured OP, `None` falls back to
+   `DEFAULT_ALLOWED_ALGS`. Six new tests in `token::verify::tests`.)
 8. **`parse_authorization_response`** accepts either a query string
    or a leading-`#`-stripped fragment unchanged. SPEC §8.10
    snapshot tests added at the same time.
