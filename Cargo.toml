@@ -1,0 +1,81 @@
+[package]
+name = "oidc4rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "OpenID Connect relying-party library built on jose4rs."
+license = "BSD-2-Clause"
+repository = "https://github.com/ogital-net/oidc4rs"
+readme = "README.md"
+keywords = ["oidc", "openid", "oauth", "authentication", "jose"]
+categories = ["authentication", "web-programming", "api-bindings"]
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md",
+    "docs/**/*.md",
+]
+
+[dependencies]
+# JOSE primitives. Pinned to the upstream `main` branch (commit
+# 96febc6: "Add AsyncHttpsJwks::select_verification_key and
+# wiremock-backed examples") ahead of the next crates.io release.
+# That commit adds the async-side `select_verification_key(kid, alg)`
+# helper that mirrors the sync `HttpsJwks::select_verification_key`,
+# closing the gap that previously forced async consumers to hand-roll
+# the selector call. The earlier rev (3c10b75) made `verify_signature`
+# / `payload` take `&JsonWebKey` so the same JWS can be reused across
+# keys. Switch back to a versioned dependency before publishing.
+#
+# Backend selection (`aws-lc` or `boring`) is gated by oidc4rs's own
+# `[features]` block below so we cannot accidentally enable both at
+# the same time.
+jose4rs = { git = "https://github.com/ogital-net/jose4rs", rev = "96febc674c4d3d077a8e53b783bdb1118fe0cdb4", default-features = false }
+
+# FFI bindings to the same backend jose4rs selected. Optional so the
+# compile-time guard below can enforce exactly-one selection.
+aws-lc-sys = { version = ">=0.40, <2", optional = true }
+boring-sys = { version = "4", optional = true }
+
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = "2"
+
+[features]
+default = ["aws-lc"]
+
+# aws-lc backend. base64-simd + jwks-https-async are kept on the jose4rs
+# dependency so callers get the same default experience jose4rs ships.
+aws-lc = [
+    "dep:aws-lc-sys",
+    "jose4rs/aws-lc",
+    "jose4rs/base64-simd",
+    "jose4rs/jwks-https-async",
+]
+
+# boring backend. base64-simd is mandatory (jose4rs requires it when
+# default features are disabled); jwks-https-async is kept on because
+# our client depends on AsyncHttpsJwks.
+boring = [
+    "dep:boring-sys",
+    "jose4rs/boring",
+    "jose4rs/base64-simd",
+    "jose4rs/jwks-https-async",
+]
+
+[dev-dependencies]
+# Test-only async runtime. The crate itself is runtime-agnostic;
+# tokio is the de-facto choice for in-crate async tests.
+tokio = { version = "1", features = ["macros", "rt"] }
+futures = "0.3"
+jsonwebtoken = "9"
+rsa = "0.9"
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
