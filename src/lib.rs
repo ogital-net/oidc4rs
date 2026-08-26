@@ -37,3 +37,9 @@ mod crypto;
 
 // Re-exported jose4rs surface commonly needed by callers.
 pub use jose4rs;
+
+// JWKS primitives needed by resource-server code that verifies bearer
+// access tokens with jose4rs directly. Re-exported here so the caller
+// does not need to depend on `jose4rs` separately just to thread the
+// same cache through their own verifier.
+pub use jose4rs::jwk::{AsyncHttpsJwks, AsyncJwksFetcher, FetchFuture, FetchResponse};

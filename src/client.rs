@@ -19,14 +19,8 @@ use crate::types::{AccessToken, ClientId, ClientSecret, RefreshToken};
 pub struct Client {
     pub(crate) metadata: ProviderMetadata,
     pub(crate) client_id: ClientId,
-    // Read by upcoming token exchange and id_token verification APIs.
-    #[allow(dead_code)]
     pub(crate) client_secret: Option<ClientSecret>,
-    // Read by upcoming id_token verification path.
-    #[allow(dead_code)]
     pub(crate) jwks: AsyncHttpsJwks,
-    // Read by upcoming transport-using APIs (token exchange, userinfo).
-    #[allow(dead_code)]
     pub(crate) http: Arc<dyn AsyncHttpClient>,
 }
 
@@ -83,6 +77,24 @@ impl Client {
 
     pub fn client_id(&self) -> &ClientId {
         &self.client_id
+    }
+
+    /// Borrows the JWKS cache used to verify this OP's ID tokens.
+    ///
+    /// The cache is shared across all ID-token / userinfo / token
+    /// verifications performed by this `Client`; callers performing
+    /// bearer-access-token verification (or any other JWS check)
+    /// against the same OP should pass this same cache to
+    /// `jose4rs::jwk::AsyncHttpsJwks::select_verification_key` so
+    /// key fetches, `kid` lookups, and `Cache-Control` honoring are
+    /// amortized across the process.
+    ///
+    /// Returning `&AsyncHttpsJwks` (not the inner `JsonWebKeySet`)
+    /// keeps the cache hot: passing the borrowed handle to the next
+    /// verify call still hits jose4rs's internal `Arc` and avoids a
+    /// second HTTP fetch when the JWKS is already cached.
+    pub fn jwks(&self) -> &AsyncHttpsJwks {
+        &self.jwks
     }
 
     /// Completes the OIDC authorization-code flow.
@@ -908,5 +920,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OidcError::InvalidAuthorizationRequest(_)));
+    }
+
+    #[test]
+    fn jwks_accessor_returns_shared_cache() {
+        // The same `AsyncHttpsJwks` should be returned across
+        // repeated calls so resource-server code can cache it in a
+        // per-request closure without losing the kid / Cache-Control
+        // state that jose4rs keeps internally.
+        let http = Arc::new(MockHttp::new(vec![]));
+        let client = Client::from_parts(
+            provider_metadata(),
+            ClientId::new("c").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let a: *const AsyncHttpsJwks = client.jwks();
+        let b: *const AsyncHttpsJwks = client.jwks();
+        assert!(std::ptr::eq(a, b));
+        // The metadata URL the cache was constructed with must match
+        // the well-known jwks_uri so a caller pulling the JWKS via
+        // `client.jwks().select_verification_key(...)` looks keys up
+        // against the right OP.
+        assert_eq!(
+            client.metadata().jwks_uri.as_url().as_str(),
+            "https://idp.example.com/jwks"
+        );
     }
 }

@@ -26,6 +26,15 @@ JOSE crate. The library must:
 - Resource-server (introspection-only) mode
 - Acting as an OpenID Provider
 
+Note: "Resource-server (introspection-only) mode" refers specifically
+to RFC 7662 token introspection. Verifying a JWT bearer access token
+at a resource server is *not* a non-goal: the library exposes
+`Client::jwks()` so the same per-OP JWKS cache can be reused by
+resource-server code that performs the JWS check via `jose4rs`
+directly. The library deliberately does not ship its own access-token
+verifier struct or claim-extraction helpers; the resource-server
+shape is "handles, not opinions".
+
 ## 3. Cryptography
 
 ### 3.1 Backend selection
@@ -233,6 +242,7 @@ children once their parent is done.
 - [x] `token::verify::IdTokenVerifier` with all checks in section 5
 - [x] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via `CRYPTO_memcmp` (see section 5 footnote)
 - [x] `IdTokenVerifier::from_metadata` narrows `allowed_algs` from `metadata.id_token_signing_alg_values_supported`; `Client::verifier()` is the convenience constructor (issuer from discovery, audience from `client_id`, trailing slash stripped from issuer so it compares byte-equal to the OP's `iss` claim)
+- [x] `Client::jwks()` exposes the per-Client `AsyncHttpsJwks` cache so resource-server code that verifies bearer JWT access tokens with `jose4rs` directly shares the same key fetches, `kid` lookups, and `Cache-Control` state. `AsyncHttpsJwks` and `AsyncJwksFetcher` are re-exported at the crate root for that purpose.
 - [x] `token::response::TokenResponse` with `AccessToken`, `RefreshToken`, `IdToken`
 - [ ] `token::response::TokenResponse` -- record `expires_in` as `Option<Instant>` for downstream refresh logic
 - [x] `token::userinfo::UserInfo` with signed-JWT body support
@@ -326,7 +336,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 |---|---|---|
 | Standard fields (`ProviderMetadata`) | Already | `metadata::ProviderMetadata` |
 | Issuer equality check | Already | `metadata::discover` |
-| JWKS fetch | Already | `AsyncHttpsJwks` |
+| JWKS fetch | Already | `AsyncHttpsJwks`; `Client::jwks()` accessor lets resource-server code reuse the same cache for bearer-JWT verification via `jose4rs` directly |
 | Forward-compatible unknown-field capture | Already | `extra: serde_json::Map` flatten |
 | `AdditionalProviderMetadata` trait | Add | openidconnect-rs has; we keep the flat map |
 | JWKS TTL / refresh hint caching | Already | `AsyncHttpsJwks` honors `cache-control` |
@@ -383,7 +393,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 
 | Feature | Status | Notes |
 |---|---|---|
-| Unit tests for all wrapper functions | Already | 77 tests passing on both backends |
+| Unit tests for all wrapper functions | Already | 78 tests passing on both backends |
 | Integration test against a mock OP | Add | SPEC §8.10 calls this out |
 | Snapshot tests for callback parsing | Add | SPEC §8.10 |
 
