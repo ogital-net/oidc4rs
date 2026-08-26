@@ -18,8 +18,10 @@
 //! `Result` is surfaced.
 
 mod backend;
+mod ct;
 mod hash;
 mod rand;
 
+pub(crate) use ct::ct_equals;
 pub(crate) use hash::sha256;
 pub(crate) use rand::fill_bytes;

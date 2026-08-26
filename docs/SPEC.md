@@ -45,6 +45,7 @@ modules so the type signatures of public API never expose FFI types.
 |---|---|---|
 | `crypto::rand::fill_bytes` | `RAND_bytes` | Nonces, state, PKCE verifier, opaque session ids |
 | `crypto::hash::sha256` | `SHA256` | PKCE S256 challenge, `at_hash` computation |
+| `crypto::ct::ct_equals` | `CRYPTO_memcmp` | Constant-time nonce equality in `IdTokenVerifier::verify` |
 
 The raw `SHA256` one-shot C symbol is chosen over `EVP_Digest` because:
 
@@ -105,6 +106,7 @@ src/
     backend.rs           cfg-gated selection of aws-lc vs boring
     rand.rs              fill_bytes wrapper
     hash.rs              sha256 wrapper
+    ct.rs                ct_equals wrapper
   types/
     mod.rs
     url.rs               newtype URLs with FromStr
@@ -188,7 +190,8 @@ children once their parent is done.
 - [x] `crypto::backend` cfg module selecting `aws-lc-sys` or `boring-sys`
 - [x] `crypto::rand::fill_bytes` wrapper with `RAND_bytes`
 - [x] `crypto::hash::sha256` wrapper with `SHA256`
-- [x] Unit tests for `fill_bytes` (length, non-zero, two consecutive calls differ) and `sha256` (FIPS 180-4 known-answer vectors)
+- [x] `crypto::ct::ct_equals` wrapper with `CRYPTO_memcmp`
+- [x] Unit tests for `fill_bytes` (length, non-zero, two consecutive calls differ) and `sha256` (FIPS 180-4 known-answer vectors) and `ct_equals` (equal, first-byte mismatch, last-byte mismatch, length mismatch, empty-vs-empty, empty-vs-non-empty)
 
 ### 8.3 Types
 
@@ -228,7 +231,7 @@ children once their parent is done.
 ### 8.8 Token verification
 
 - [x] `token::verify::IdTokenVerifier` with all checks in section 5
-- [ ] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via SHA-256 digests (see section 5 footnote)
+- [x] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via `CRYPTO_memcmp` (see section 5 footnote)
 - [ ] `Client::discover` / `Client::from_parts` -- auto-narrow `IdTokenVerifier::allowed_algs` from `metadata.id_token_signing_alg_values_supported`; expose `Client::verifier()`
 - [x] `token::response::TokenResponse` with `AccessToken`, `RefreshToken`, `IdToken`
 - [ ] `token::response::TokenResponse` -- record `expires_in` as `Option<Instant>` for downstream refresh logic
@@ -303,7 +306,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 |---|---|---|
 | All SPEC section 5 checks | Already | Single call site in `IdTokenVerifier::verify` |
 | JWKS kid refresh on miss | Already | `AsyncHttpsJwks::select_verification_key` |
-| Constant-time nonce compare | Add | See section 5 footnote; currently `==` |
+| Constant-time nonce compare | Already | `crypto::ct::ct_equals` wrapping `CRYPTO_memcmp`; called from `check_nonce` |
 | Algorithm allow-list seeded from discovery | Add | openidconnect-rs threads `id_token_signing_alg_values_supported`; we default to the full Core set |
 | Insecure verify (skip signature) | Defer | OpenSSF discourages; documentation only |
 
@@ -401,7 +404,8 @@ by impact and dependency order:
 4. **Auth-request extension params** (`display`, `claims_locales`)
    added to the builder.
 5. **Constant-time nonce comparison** in `IdTokenVerifier`. See
-   section 5 footnote.
+   section 5 footnote. (Done -- `crypto::ct::ct_equals` wrapping
+   `CRYPTO_memcmp`; called from `token::verify::check_nonce`.)
 6. **Auto-`sub` check** in `Client::fetch_userinfo`: compare the
    `sub` claim against the ID-token's `sub` when a verifier is
    supplied.

@@ -196,12 +196,16 @@ fn check_azp(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcError> {
 }
 
 /// Enforces that the JWT `nonce` claim matches the second-leg value.
+///
+/// Comparison uses `crypto::ct::ct_equals` (constant-time byte
+/// equality via `CRYPTO_memcmp`) so the comparison does not leak the
+/// nonce byte-by-byte through a timing oracle. See SPEC section 5.
 fn check_nonce(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcError> {
     if let Some(expected) = ctx.expected_nonce.as_deref() {
         let got = claims.string_claim("nonce").ok_or_else(|| {
             OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new("nonce claim required"))
         })?;
-        if got != expected {
+        if !crate::crypto::ct_equals(got.as_bytes(), expected.as_bytes()) {
             return Err(OidcError::InvalidIdToken(
                 jose4rs::jwt::InvalidJwtError::new("nonce does not match expected"),
             ));
