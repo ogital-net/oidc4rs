@@ -21,20 +21,11 @@ include = [
 ]
 
 [dependencies]
-# JOSE primitives. Pinned to the upstream `main` branch (commit
-# 96febc6: "Add AsyncHttpsJwks::select_verification_key and
-# wiremock-backed examples") ahead of the next crates.io release.
-# That commit adds the async-side `select_verification_key(kid, alg)`
-# helper that mirrors the sync `HttpsJwks::select_verification_key`,
-# closing the gap that previously forced async consumers to hand-roll
-# the selector call. The earlier rev (3c10b75) made `verify_signature`
-# / `payload` take `&JsonWebKey` so the same JWS can be reused across
-# keys. Switch back to a versioned dependency before publishing.
-#
+# JOSE primitives. Pin to a major version; allow minor bumps.
 # Backend selection (`aws-lc` or `boring`) is gated by oidc4rs's own
 # `[features]` block below so we cannot accidentally enable both at
 # the same time.
-jose4rs = { git = "https://github.com/ogital-net/jose4rs", rev = "96febc674c4d3d077a8e53b783bdb1118fe0cdb4", default-features = false }
+jose4rs = { version = "0.2", default-features = false }
 
 # FFI bindings to the same backend jose4rs selected. Optional so the
 # compile-time guard below can enforce exactly-one selection.
