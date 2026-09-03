@@ -25,14 +25,14 @@ include = [
 # Backend selection (`aws-lc` or `boring`) is gated by oidc4rs's own
 # `[features]` block below so we cannot accidentally enable both at
 # the same time.
-jose4rs = { version = "0.2", default-features = false }
+jose4rs = { version = "0.4", default-features = false }
 
 # FFI bindings to the same backend jose4rs selected. Optional so the
 # compile-time guard below can enforce exactly-one selection.
 aws-lc-sys = { version = ">=0.40, <2", optional = true }
 boring-sys = { version = "4", optional = true }
 
-base64 = "0.22"
+base64 = "0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
