@@ -12,6 +12,7 @@
 //! [`AuthRequestState::to_pending`] for the serializable form stored
 //! in the second-leg KV.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -66,7 +67,7 @@ impl AuthRequestState {
 ///
 /// Stored under [`Self::key_for`]; the same `state` value the OP
 /// echoes back on the callback is the lookup key.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingAuthRequest {
     pub state: String,
     pub nonce: String,
@@ -76,6 +77,20 @@ pub struct PendingAuthRequest {
     pub redirect_uri: Option<String>,
     pub scopes: Vec<String>,
     pub created_at: std::time::SystemTime,
+}
+
+impl fmt::Debug for PendingAuthRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingAuthRequest")
+            .field("state", &self.state)
+            .field("nonce", &"***")
+            .field("pkce_verifier", &self.pkce_verifier.as_ref().map(|_| "***"))
+            .field("max_age", &self.max_age)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scopes", &self.scopes)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl PendingAuthRequest {

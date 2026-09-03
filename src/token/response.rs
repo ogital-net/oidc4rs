@@ -1,5 +1,7 @@
 //! Token response shape and id_token parsing.
 
+use std::fmt;
+
 use serde::{Deserialize, Deserializer};
 
 use jose4rs::error::JoseError;
@@ -16,7 +18,7 @@ use crate::types::{AccessToken, RefreshToken};
 /// wire format stays a plain string, but downstream APIs see typed
 /// values that cannot accidentally be passed where a `ClientId` or
 /// `Scope` is expected.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     #[serde(deserialize_with = "deserialize_access_token")]
     pub access_token: AccessToken,
@@ -29,6 +31,19 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &self.access_token)
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token", &self.refresh_token)
+            .field("id_token", &self.id_token.as_ref().map(|_| "***"))
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 fn deserialize_access_token<'de, D>(d: D) -> Result<AccessToken, D::Error>
@@ -58,12 +73,22 @@ where
 /// `raw` is the original compact serialization for downstream
 /// re-verification by [`crate::token::verify::IdTokenVerifier`]. The
 /// `claims` are parsed but **not yet cryptographically verified**.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdToken {
     pub raw: String,
     pub claims: JwtClaims,
     pub header_alg: String,
     pub header_kid: Option<String>,
+}
+
+impl fmt::Debug for IdToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdToken")
+            .field("raw", &"***")
+            .field("header_alg", &self.header_alg)
+            .field("header_kid", &self.header_kid)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IdToken {

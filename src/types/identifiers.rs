@@ -5,10 +5,41 @@ use std::fmt;
 use crate::crypto::fill_bytes;
 use crate::error::OidcError;
 
+/// Implements a `Debug` that hides the wrapped value. Applied to every
+/// credential- or token-grade newtype so `{:?}` in a log or error path
+/// cannot leak the secret.
+macro_rules! redacted_debug {
+    ($name:ident) => {
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&"***").finish()
+            }
+        }
+    };
+}
+
 macro_rules! nonempty_string_newtype {
+    // Secret-bearing newtype: identical API but a redacting `Debug`.
+    (secret $(#[$meta:meta])* $name:ident) => {
+        nonempty_string_newtype!(@build $(#[$meta])* $name);
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&"***").finish()
+            }
+        }
+    };
+    // Non-secret newtype: `Debug` shows the wrapped value.
     ($(#[$meta:meta])* $name:ident) => {
+        nonempty_string_newtype!(@build $(#[$meta])* $name);
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.0).finish()
+            }
+        }
+    };
+    (@build $(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Clone, PartialEq, Eq, Hash)]
         pub struct $name(String);
 
         impl $name {
@@ -47,7 +78,7 @@ nonempty_string_newtype!(
     ClientId
 );
 
-nonempty_string_newtype!(
+nonempty_string_newtype!(secret
     /// OIDC client secret. Optional for public clients.
     ClientSecret
 );
@@ -95,8 +126,10 @@ impl<'de> serde::Deserialize<'de> for Scope {
 }
 
 /// Cryptographically random nonce for replay defense on the ID token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Nonce(String);
+
+redacted_debug!(Nonce);
 
 impl Nonce {
     pub fn new_random() -> Self {
@@ -110,8 +143,10 @@ impl Nonce {
 
 /// Cryptographically random state value for CSRF defense on the
 /// authorization callback.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct State(String);
+
+redacted_debug!(State);
 
 impl State {
     pub fn new_random() -> Self {
@@ -124,8 +159,10 @@ impl State {
 }
 
 /// PKCE code verifier per RFC 7636 section 4.1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PkceCodeVerifier(String);
+
+redacted_debug!(PkceCodeVerifier);
 
 impl PkceCodeVerifier {
     pub fn new_random() -> Self {
@@ -248,8 +285,10 @@ pub enum TokenEndpointAuthMethod {
 /// access-token value, and RFC 6750 forbids using it as a URL
 /// parameter or as a form-encoded body field unless the access-token
 /// type permits it. Callers should treat the inner value as opaque.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AccessToken(String);
+
+redacted_debug!(AccessToken);
 
 impl AccessToken {
     /// Wraps a raw access-token string. Empty strings are rejected:
@@ -288,8 +327,10 @@ impl AsRef<str> for AccessToken {
 ///
 /// Opaque bearer string issued by the OP. Empty strings are rejected
 /// for the same reason as [`AccessToken`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RefreshToken(String);
+
+redacted_debug!(RefreshToken);
 
 impl RefreshToken {
     pub fn new(s: impl Into<String>) -> Result<Self, OidcError> {
@@ -338,4 +379,45 @@ fn random_url_safe(n: usize) -> String {
     let mut bytes = vec![0u8; n];
     fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_newtypes_redact_debug_output() {
+        let secret = ClientSecret::new("super-secret-value").unwrap();
+        let access = AccessToken::new("access-token-value").unwrap();
+        let refresh = RefreshToken::new("refresh-token-value").unwrap();
+        let verifier = PkceCodeVerifier::new_random();
+        let nonce = Nonce::new_random();
+        let state = State::new_random();
+
+        for rendered in [
+            format!("{secret:?}"),
+            format!("{access:?}"),
+            format!("{refresh:?}"),
+            format!("{verifier:?}"),
+            format!("{nonce:?}"),
+            format!("{state:?}"),
+        ] {
+            assert!(
+                rendered.contains("***"),
+                "expected redaction, got {rendered}"
+            );
+        }
+
+        // The wrapped value must not leak.
+        assert!(!format!("{secret:?}").contains("super-secret-value"));
+        assert!(!format!("{access:?}").contains("access-token-value"));
+        assert!(!format!("{refresh:?}").contains("refresh-token-value"));
+        assert!(!format!("{verifier:?}").contains(verifier.as_str()));
+    }
+
+    #[test]
+    fn non_secret_newtype_debug_shows_value() {
+        let id = ClientId::new("public-client-id").unwrap();
+        assert!(format!("{id:?}").contains("public-client-id"));
+    }
 }

@@ -5,6 +5,7 @@
 //! ureq, curl). See `examples/reqwest_adapter.rs` for a reference
 //! implementation.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,12 +20,51 @@ pub enum HttpMethod {
     Post,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+}
+
+/// Headers whose values carry credentials and must be masked in
+/// `Debug` output.
+fn is_sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The token-request body is form-encoded credentials and the
+        // Authorization header is a bearer/basic secret; neither is
+        // ever printed verbatim.
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    if is_sensitive_header(k) {
+                        "***"
+                    } else {
+                        v.as_str()
+                    },
+                )
+            })
+            .collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field(
+                "body",
+                &self.body.as_ref().map(|b| format!("<{} bytes>", b.len())),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

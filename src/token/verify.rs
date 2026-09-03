@@ -50,6 +50,13 @@ pub const DEFAULT_ALLOWED_ALGS: &[&str] = &[
     "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA",
 ];
 
+/// Algorithms that must never seed an ID-token or UserInfo allow-list:
+/// `none` (unsecured JWS) and the HS* family (symmetric; this RP has no
+/// path to supply the shared secret as a verification key).
+pub(crate) fn is_forbidden_alg(alg: &str) -> bool {
+    alg.eq_ignore_ascii_case("none") || matches!(alg, "HS256" | "HS384" | "HS512")
+}
+
 /// Configured verifier. Constructed once per relying-party, then
 /// reused for every callback.
 pub struct IdTokenVerifier {
@@ -89,7 +96,12 @@ impl IdTokenVerifier {
         Self {
             expected_issuer: metadata.issuer.as_str().to_owned(),
             expected_audience: audience.into(),
-            allowed_algs: metadata.id_token_signing_alg_values_supported.clone(),
+            allowed_algs: metadata
+                .id_token_signing_alg_values_supported
+                .iter()
+                .filter(|alg| !is_forbidden_alg(alg))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -139,7 +151,7 @@ impl IdTokenVerifier {
         let claims = verify_signature_and_claims(self, token, &key, ctx)?;
 
         // 5. azp.
-        check_azp(&claims, ctx)?;
+        check_azp(&claims, ctx, &self.expected_audience)?;
 
         // 6. nonce.
         check_nonce(&claims, ctx)?;
@@ -154,6 +166,13 @@ impl IdTokenVerifier {
     }
 
     fn check_alg(&self, alg: &str) -> Result<(), OidcError> {
+        // `none` is never acceptable, even if a caller widened the
+        // allow-list: an unsecured JWS carries no signature to verify.
+        if alg.eq_ignore_ascii_case("none") {
+            return Err(OidcError::UnsupportedAlgorithm(
+                "the `none` algorithm is never accepted for ID tokens".into(),
+            ));
+        }
         if !self.allowed_algs.iter().any(|a| a == alg) {
             return Err(OidcError::UnsupportedAlgorithm(alg.to_owned()));
         }
@@ -212,24 +231,27 @@ fn verify_signature_and_claims(
         .map_err(Into::into)
 }
 
-/// Enforces the azp rule from SPEC §5.
-fn check_azp(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcError> {
-    let Some(aud) = claims.audience() else {
+/// Enforces the azp rules from OIDC Core 1.0 section 3.1.3.7: azp is
+/// required when `aud` is multi-valued, and whenever azp is present it
+/// must equal the relying party's client id.
+fn check_azp(
+    claims: &JwtClaims,
+    ctx: &VerifyContext,
+    expected_audience: &str,
+) -> Result<(), OidcError> {
+    let azp = claims.string_claim("azp");
+    let multi_aud = claims.audience().is_some_and(|aud| aud.len() > 1);
+    if multi_aud && azp.is_none() {
+        return Err(OidcError::InvalidIdToken(
+            jose4rs::jwt::InvalidJwtError::new("azp claim required when aud has multiple values"),
+        ));
+    }
+    let Some(azp) = azp else {
         return Ok(());
     };
-    if aud.len() <= 1 {
-        return Ok(());
-    }
-    let azp = claims.string_claim("azp").ok_or_else(|| {
-        OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
-            "azp claim required when aud has multiple values",
-        ))
-    })?;
-    let expected = ctx.client_id.as_deref().ok_or_else(|| {
-        OidcError::InvalidAuthorizationRequest(
-            "client_id required in VerifyContext for multi-aud azp check".into(),
-        )
-    })?;
+    // The client id is the expected audience; ctx.client_id overrides
+    // it only when the caller supplies a different value.
+    let expected = ctx.client_id.as_deref().unwrap_or(expected_audience);
     if azp != expected {
         return Err(OidcError::InvalidIdToken(
             jose4rs::jwt::InvalidJwtError::new("azp does not match client_id"),
@@ -866,5 +888,109 @@ mod tests {
         let meta = metadata_with_algs(vec!["RS256".into(), "ZZ999".into()]);
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
         assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ZZ999".to_owned()]);
+    }
+
+    #[test]
+    fn from_metadata_filters_none_and_symmetric_algs() {
+        let meta = metadata_with_algs(vec![
+            "none".into(),
+            "RS256".into(),
+            "HS256".into(),
+            "ES256".into(),
+            "HS512".into(),
+        ]);
+        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
+        assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ES256".to_owned()]);
+    }
+
+    #[test]
+    fn check_alg_hard_rejects_none_even_when_allowlisted() {
+        let v = IdTokenVerifier::new("https://idp.example.com", "my-client")
+            .with_allowed_algs(vec!["none".to_owned()]);
+        let err = v.check_alg("none").unwrap_err();
+        assert!(matches!(err, OidcError::UnsupportedAlgorithm(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_multi_aud_without_azp() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": ["my-client", "other-client"],
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+    }
+
+    #[tokio::test]
+    async fn accepts_multi_aud_with_matching_azp() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": ["my-client", "other-client"],
+            "azp": "my-client",
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        let jwks = build_jwks(&jwk);
+        let parsed = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap();
+        assert_eq!(parsed.subject().unwrap(), "user-1");
+    }
+
+    #[tokio::test]
+    async fn rejects_multi_aud_with_mismatched_azp() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": ["my-client", "other-client"],
+            "azp": "other-client",
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_single_aud_with_mismatched_azp() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "azp": "attacker",
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
     }
 }

@@ -41,17 +41,22 @@ impl UserInfoVerifier {
 
     /// Creates a verifier from the provider's UserInfo algorithm list.
     pub fn from_metadata(metadata: &ProviderMetadata, audience: impl Into<String>) -> Self {
-        let default_algs = DEFAULT_ALLOWED_ALGS
+        let default_algs: Vec<String> = DEFAULT_ALLOWED_ALGS
             .iter()
             .map(|alg| (*alg).to_owned())
             .collect();
+        let allowed_algs = match &metadata.userinfo_signing_alg_values_supported {
+            Some(advertised) => advertised
+                .iter()
+                .filter(|alg| !crate::token::verify::is_forbidden_alg(alg))
+                .cloned()
+                .collect(),
+            None => default_algs,
+        };
         Self {
             expected_issuer: metadata.issuer.as_str().to_owned(),
             expected_audience: audience.into(),
-            allowed_algs: metadata
-                .userinfo_signing_alg_values_supported
-                .clone()
-                .unwrap_or(default_algs),
+            allowed_algs,
         }
     }
 
@@ -72,6 +77,11 @@ impl UserInfoVerifier {
         jwks: &AsyncHttpsJwks,
     ) -> Result<UserInfo, OidcError> {
         let token = crate::token::response::IdToken::parse(compact_jws)?;
+        if token.header_alg.eq_ignore_ascii_case("none") {
+            return Err(OidcError::UnsupportedAlgorithm(
+                "the `none` algorithm is never accepted for UserInfo".into(),
+            ));
+        }
         if !self
             .allowed_algs
             .iter()
@@ -469,5 +479,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OidcError::UnsupportedAlgorithm(ref alg) if alg == "RS384"));
+    }
+
+    #[test]
+    fn from_metadata_filters_none_and_symmetric_algs() {
+        let meta: ProviderMetadata = serde_json::from_value(json!({
+            "issuer": ISS,
+            "authorization_endpoint": "https://idp.example.com/auth",
+            "token_endpoint": "https://idp.example.com/token",
+            "jwks_uri": "https://idp.example.com/jwks",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "userinfo_signing_alg_values_supported": ["none", "RS256", "HS256", "ES256"],
+        }))
+        .unwrap();
+        let v = UserInfoVerifier::from_metadata(&meta, AUD);
+        assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ES256".to_owned()]);
     }
 }
