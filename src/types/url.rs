@@ -76,11 +76,75 @@ macro_rules! https_url_newtype {
     };
 }
 
-https_url_newtype!(
-    /// Issuer URL. Used as the basis for discovery via
-    /// `/.well-known/openid-configuration`.
-    IssuerUrl
-);
+/// Issuer identifier used for discovery and exact claim comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IssuerUrl {
+    url: Url,
+    serialized: String,
+}
+
+impl IssuerUrl {
+    pub fn as_url(&self) -> &Url {
+        &self.url
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.serialized
+    }
+
+    pub fn into_inner(self) -> Url {
+        self.url
+    }
+}
+
+impl fmt::Display for IssuerUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.serialized)
+    }
+}
+
+impl FromStr for IssuerUrl {
+    type Err = OidcError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let url = Url::parse(s).map_err(|e| OidcError::InvalidUrl(e.to_string()))?;
+        if url.scheme() != "https" {
+            return Err(OidcError::InvalidUrl(format!(
+                "IssuerUrl requires https, got {}",
+                url.scheme()
+            )));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(OidcError::InvalidUrl(
+                "IssuerUrl must not contain a query or fragment".into(),
+            ));
+        }
+        Ok(Self {
+            url,
+            serialized: s.to_owned(),
+        })
+    }
+}
+
+impl Serialize for IssuerUrl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.serialized)
+    }
+}
+
+impl<'de> Deserialize<'de> for IssuerUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let serialized = String::deserialize(deserializer)?;
+        serialized.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl AsRef<Url> for IssuerUrl {
+    fn as_ref(&self) -> &Url {
+        &self.url
+    }
+}
+
 https_url_newtype!(
     /// Authorization endpoint URL.
     AuthUrl
@@ -206,5 +270,31 @@ impl<'de> Deserialize<'de> for PostLogoutRedirectUrl {
 impl AsRef<Url> for PostLogoutRedirectUrl {
     fn as_ref(&self) -> &Url {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issuer_preserves_exact_serialized_value() {
+        let without_slash = IssuerUrl::from_str("https://idp.example.com").unwrap();
+        let with_slash = IssuerUrl::from_str("https://idp.example.com/").unwrap();
+
+        assert_eq!(without_slash.as_url(), with_slash.as_url());
+        assert_ne!(without_slash, with_slash);
+        assert_eq!(without_slash.as_str(), "https://idp.example.com");
+        assert_eq!(with_slash.as_str(), "https://idp.example.com/");
+        assert_eq!(
+            serde_json::to_string(&without_slash).unwrap(),
+            r#""https://idp.example.com""#
+        );
+    }
+
+    #[test]
+    fn issuer_rejects_query_and_fragment() {
+        assert!(IssuerUrl::from_str("https://idp.example.com?tenant=a").is_err());
+        assert!(IssuerUrl::from_str("https://idp.example.com#issuer").is_err());
     }
 }

@@ -59,6 +59,7 @@ impl Client {
         client_secret: Option<ClientSecret>,
         http: Arc<dyn AsyncHttpClient>,
     ) -> Result<Self, OidcError> {
+        metadata.validate()?;
         let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(HttpJwksFetcher { http: http.clone() });
         let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
 
@@ -109,9 +110,10 @@ impl Client {
     /// 1. Parses the callback.
     /// 2. Looks up the pending request by `state`.
     /// 3. Verifies the `state` matches (CSRF defense).
-    /// 4. POSTs the token request, including PKCE verifier if any.
-    /// 5. Deletes the pending entry to prevent replay.
-    /// 6. Returns the parsed [`TokenResponse`] plus the pending request
+    /// 4. Rejects stale or future-dated pending requests.
+    /// 5. POSTs the token request, including PKCE verifier if any.
+    /// 6. Deletes the pending entry to prevent replay.
+    /// 7. Returns the parsed [`TokenResponse`] plus the pending request
     ///    snapshot for downstream logic (e.g. nonce verification).
     ///
     /// The ID-token verification step is *not* performed here. Callers
@@ -124,6 +126,20 @@ impl Client {
         kv: &dyn AsyncKvStore,
     ) -> Result<CompleteAuthorization, OidcError> {
         let response = parse_authorization_response(callback_query)?;
+        let expected_issuer = self.metadata.issuer.as_str();
+        match response.iss.as_deref() {
+            Some(actual) if actual != expected_issuer => {
+                return Err(crate::flow::callback::CallbackError::IssuerMismatch {
+                    expected: expected_issuer.to_owned(),
+                    actual: actual.to_owned(),
+                }
+                .into());
+            }
+            None if self.metadata.authorization_response_iss_parameter_supported => {
+                return Err(crate::flow::callback::CallbackError::Missing("iss").into());
+            }
+            Some(_) | None => {}
+        }
         let key = PendingAuthRequest::key_for(&response.state);
 
         let raw = kv.get(&key).await?.ok_or(OidcError::AuthorizationResponse(
@@ -137,6 +153,10 @@ impl Client {
                     "state mismatch between callback and pending entry".into(),
                 ),
             ));
+        }
+        if let Err(error) = pending.validate_created_at(std::time::SystemTime::now()) {
+            let _ = kv.delete(&key).await;
+            return Err(error);
         }
 
         let mut builder: CodeTokenRequest = self.exchange_code(response.code.clone())?;
@@ -170,7 +190,7 @@ impl Client {
         let method = crate::flow::token::TokenAuthMethod::from_metadata(
             supported,
             self.client_secret.is_some(),
-        );
+        )?;
         Ok(CodeTokenRequest::new(
             self.metadata().token_endpoint.clone(),
             self.client_id().clone(),
@@ -191,8 +211,8 @@ impl Client {
     /// - `application/json` -- claims parsed directly into
     ///   [`UserInfo`].
     /// - `application/jwt` -- a signed JWT. Signature, issuer,
-    ///   audience, expiry, and algorithm are enforced via
-    ///   `verifier` (the same one used for ID-token verification).
+    ///   audience, and the provider's UserInfo algorithm policy are
+    ///   enforced.
     ///
     /// OIDC Core 1.0 section 5.4. The endpoint URL comes from
     /// `metadata.userinfo_endpoint`; returns an error if the OP
@@ -200,7 +220,7 @@ impl Client {
     pub async fn fetch_userinfo(
         &self,
         access_token: &AccessToken,
-        verifier: &crate::token::verify::IdTokenVerifier,
+        expected_subject: &str,
     ) -> Result<crate::token::userinfo::UserInfo, OidcError> {
         let endpoint = self.metadata().userinfo_endpoint.as_ref().ok_or_else(|| {
             OidcError::InvalidMetadata("provider metadata missing userinfo_endpoint".into())
@@ -229,20 +249,27 @@ impl Client {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map_or("application/json", |(_, v)| v.as_str());
-        if content_type_essence_is(content_type, "application/jwt") {
+        let userinfo = if content_type_essence_is(content_type, "application/jwt") {
             let compact = std::str::from_utf8(&resp.body).map_err(|_| {
                 OidcError::InvalidAuthorizationRequest(
                     "userinfo JWT body is not valid UTF-8".into(),
                 )
             })?;
-            crate::token::userinfo::UserInfo::from_signed_jwt(compact, verifier, &self.jwks).await
+            let verifier = crate::token::userinfo::UserInfoVerifier::from_metadata(
+                &self.metadata,
+                self.client_id.as_str(),
+            );
+            crate::token::userinfo::UserInfo::from_signed_jwt(compact, &verifier, &self.jwks)
+                .await?
         } else if content_type_essence_is(content_type, "application/json") {
-            crate::token::userinfo::UserInfo::from_json(&resp.body)
+            crate::token::userinfo::UserInfo::from_json(&resp.body)?
         } else {
-            Err(OidcError::InvalidAuthorizationRequest(format!(
+            return Err(OidcError::InvalidAuthorizationRequest(format!(
                 "unexpected userinfo Content-Type: {content_type:?}"
-            )))
-        }
+            )));
+        };
+        userinfo.verify_subject(expected_subject)?;
+        Ok(userinfo)
     }
 
     /// Begins a refresh-token grant. See [`RefreshTokenRequest`] for
@@ -258,7 +285,7 @@ impl Client {
         let method = crate::flow::token::TokenAuthMethod::from_metadata(
             supported,
             self.client_secret.is_some(),
-        );
+        )?;
         Ok(RefreshTokenRequest::new(
             self.metadata().token_endpoint.clone(),
             self.client_id().clone(),
@@ -275,9 +302,7 @@ impl Client {
     /// - The `allowed_algs` list is narrowed to whatever the OP
     ///   advertised in `id_token_signing_alg_values_supported`, so
     ///   the verifier cannot be tricked into accepting a `none` or
-    ///   weaker algorithm the OP has stopped using. When the field
-    ///   is absent, the verifier falls back to the OIDC Core 1.0
-    ///   default `id_token` `alg` set.
+    ///   weaker algorithm the OP has stopped using.
     ///
     /// Callers can further narrow or widen the list with
     /// `IdTokenVerifier::allow_alg` /
@@ -348,6 +373,7 @@ impl CompleteAuthorization {
             access_token: Some(self.token_response.access_token.as_str().to_owned()),
             client_id: Some(client_id.to_owned()),
             clock_skew: None,
+            expected_max_age: self.pending.max_age,
         };
         verifier.verify(&id_token, jwks, &ctx).await
     }
@@ -592,6 +618,7 @@ mod tests {
             state: state.to_string(),
             nonce: "nonce-abc".to_string(),
             pkce_verifier: Some("verifier-1234567890".to_string()),
+            max_age: None,
             redirect_uri: Some("https://app.example.com/cb".to_string()),
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
@@ -652,6 +679,7 @@ mod tests {
             state: "real-state".into(),
             nonce: "nonce-1".into(),
             pkce_verifier: None,
+            max_age: None,
             redirect_uri: Some("https://app.example.com/cb".into()),
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
@@ -667,6 +695,110 @@ mod tests {
         let query = "code=AUTH-CODE&state=other-state";
         let err = client.complete_authorization(query, &kv).await.unwrap_err();
         let _ = err; // expect AuthorizationResponse variant; we just confirm it errors
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_rejects_invalid_pending_age() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let client = Client::from_parts(
+            provider_metadata(),
+            ClientId::new("my-client").unwrap(),
+            Some(ClientSecret::new("secret").unwrap()),
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let kv = MockKv::new();
+        let now = std::time::SystemTime::now();
+        let cases = [
+            (
+                "stale-state",
+                now - PendingAuthRequest::DEFAULT_TTL - std::time::Duration::from_secs(1),
+                OidcError::PendingAuthorizationExpired,
+            ),
+            (
+                "future-state",
+                now + std::time::Duration::from_secs(60),
+                OidcError::PendingAuthorizationFromFuture,
+            ),
+        ];
+
+        for (state, created_at, expected) in cases {
+            let pending = PendingAuthRequest {
+                state: state.into(),
+                nonce: "nonce".into(),
+                pkce_verifier: None,
+                max_age: None,
+                redirect_uri: Some("https://app.example.com/cb".into()),
+                scopes: vec!["openid".into()],
+                created_at,
+            };
+            let key = PendingAuthRequest::key_for(state);
+            kv.put(&key, serde_json::to_vec(&pending).unwrap(), None)
+                .await
+                .unwrap();
+
+            let query = format!("code=AUTH-CODE&state={state}");
+            let error = client
+                .complete_authorization(&query, &kv)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert!(kv.get(&key).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_rejects_wrong_callback_issuer() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let mut metadata = provider_metadata();
+        metadata.authorization_response_iss_parameter_supported = true;
+        let client = Client::from_parts(
+            metadata,
+            ClientId::new("my-client").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+
+        let err = client
+            .complete_authorization(
+                "code=AUTH-CODE&state=state-1&iss=https%3A%2F%2Fattacker.example.com",
+                &MockKv::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OidcError::AuthorizationResponse(
+                crate::flow::callback::CallbackError::IssuerMismatch { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_requires_advertised_callback_issuer() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let mut metadata = provider_metadata();
+        metadata.authorization_response_iss_parameter_supported = true;
+        let client = Client::from_parts(
+            metadata,
+            ClientId::new("my-client").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+
+        let err = client
+            .complete_authorization("code=AUTH-CODE&state=state-1", &MockKv::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OidcError::AuthorizationResponse(crate::flow::callback::CallbackError::Missing("iss"))
+        ));
     }
 
     #[tokio::test]
@@ -695,6 +827,7 @@ mod tests {
             state: state.into(),
             nonce: "n".into(),
             pkce_verifier: None,
+            max_age: None,
             redirect_uri: Some("https://app.example.com/cb".into()),
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
@@ -742,7 +875,8 @@ mod tests {
         let req = client
             .exchange_code("code".into())
             .unwrap()
-            .redirect_uri("https://app.example.com/cb");
+            .redirect_uri("https://app.example.com/cb")
+            .pkce_verifier("verifier-1234567890");
         let built = req.build().unwrap();
         assert!(built.http.headers.iter().any(|(k, _)| k == "Authorization"));
     }
@@ -760,9 +894,13 @@ mod tests {
         let req = client
             .exchange_code("code".into())
             .unwrap()
-            .redirect_uri("https://app.example.com/cb");
+            .redirect_uri("https://app.example.com/cb")
+            .pkce_verifier("verifier-1234567890");
         let built = req.build().unwrap();
         assert!(built.http.headers.iter().all(|(k, _)| k != "Authorization"));
+        let body = String::from_utf8(built.http.body.unwrap()).unwrap();
+        assert!(body.contains("client_id=c"));
+        assert!(body.contains("code_verifier=verifier-1234567890"));
     }
 
     #[tokio::test]
@@ -788,9 +926,8 @@ mod tests {
         )
         .unwrap();
         let access_token = crate::types::AccessToken::new("AT-1").unwrap();
-        let verifier = crate::token::verify::IdTokenVerifier::new("https://idp.example.com", "c");
         let info = client
-            .fetch_userinfo(&access_token, &verifier)
+            .fetch_userinfo(&access_token, "user-1")
             .await
             .unwrap();
         assert_eq!(info.sub, "user-1");
@@ -816,11 +953,7 @@ mod tests {
         )
         .unwrap();
         let access_token = crate::types::AccessToken::new("AT-7").unwrap();
-        let verifier = crate::token::verify::IdTokenVerifier::new("https://idp.example.com", "c");
-        client
-            .fetch_userinfo(&access_token, &verifier)
-            .await
-            .unwrap();
+        client.fetch_userinfo(&access_token, "x").await.unwrap();
 
         let last = http.last_request.lock().unwrap().clone().unwrap();
         assert_eq!(last.method, HttpMethod::Get);
@@ -850,9 +983,8 @@ mod tests {
         )
         .unwrap();
         let access_token = crate::types::AccessToken::new("AT-1").unwrap();
-        let verifier = crate::token::verify::IdTokenVerifier::new("https://idp.example.com", "c");
         let err = client
-            .fetch_userinfo(&access_token, &verifier)
+            .fetch_userinfo(&access_token, "user-1")
             .await
             .unwrap_err();
         assert!(matches!(err, OidcError::InvalidMetadata(_)));
@@ -879,9 +1011,8 @@ mod tests {
         )
         .unwrap();
         let access_token = crate::types::AccessToken::new("AT-1").unwrap();
-        let verifier = crate::token::verify::IdTokenVerifier::new("https://idp.example.com", "c");
         let err = client
-            .fetch_userinfo(&access_token, &verifier)
+            .fetch_userinfo(&access_token, "user-1")
             .await
             .unwrap_err();
         match err {
@@ -914,12 +1045,35 @@ mod tests {
         )
         .unwrap();
         let access_token = crate::types::AccessToken::new("AT-1").unwrap();
-        let verifier = crate::token::verify::IdTokenVerifier::new("https://idp.example.com", "c");
         let err = client
-            .fetch_userinfo(&access_token, &verifier)
+            .fetch_userinfo(&access_token, "user-1")
             .await
             .unwrap_err();
         assert!(matches!(err, OidcError::InvalidAuthorizationRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_userinfo_rejects_subject_mismatch() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"sub":"other-user","name":"Mallory"}"#.to_vec(),
+        };
+        let http = Arc::new(MockHttp::new(vec![resp]));
+        let client = Client::from_parts(
+            provider_metadata_with_userinfo(),
+            ClientId::new("c").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let access_token = crate::types::AccessToken::new("AT-1").unwrap();
+
+        let err = client
+            .fetch_userinfo(&access_token, "verified-user")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::UserInfoSubjectMismatch));
     }
 
     #[test]

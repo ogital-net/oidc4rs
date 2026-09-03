@@ -50,6 +50,7 @@ where
 
     let metadata: ProviderMetadata = serde_json::from_slice(&resp.body)
         .map_err(|e| OidcError::InvalidMetadata(e.to_string()))?;
+    metadata.validate()?;
 
     if metadata.issuer != issuer {
         return Err(OidcError::InvalidMetadata(format!(

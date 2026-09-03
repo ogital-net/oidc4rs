@@ -1,27 +1,7 @@
-//! SHA-256 via the selected FFI backend.
+//! SHA-2 via the selected FFI backend.
 //!
-//! Exposes a one-shot [`sha256`] function that hashes a contiguous
-//! buffer in a single FFI call, using the raw `SHA256` C symbol
-//! (matches jose4rs's `crypto::digest::digest_buf` fast path).
-//!
-//! Under the hood both aws-lc and BoringSSL resolve `SHA256` to a
-//! pre-compiled `EVP_DigestInit_ex` + `EVP_DigestUpdate` +
-//! `EVP_DigestFinal_ex` chain -- the same three operations the
-//! `EVP_Digest` wrapper does, just without the per-call `EVP_MD_CTX`
-//! allocation, method-table dispatch, and function-pointer overhead.
-//!
-//! Failure modes (verified in `docs/SPEC.md` section 3.4):
-//!
-//! - BoringSSL: `SHA256` does not take the FIPS service-indicator
-//!   lock, never aborts, never returns NULL.
-//! - aws-lc: `SHA256` takes the FIPS lock. The lock overflow path
-//!   aborts but the source itself calls it "impossible on a 64-bit
-//!   system". This is the same theoretical abort risk `RAND_bytes`
-//!   carries and is documented in `docs/SPEC.md` section 3.4.
-//!
-//! Streaming hashers can be added in the future by wrapping
-//! `EVP_DigestInit_ex` / `EVP_DigestUpdate` / `EVP_DigestFinal_ex` in
-//! a `Send + Sync` newtype, the same shape jose4rs uses internally.
+//! Exposes one-shot hash functions for SHA-256, SHA-384, and SHA-512
+//! that hash a contiguous buffer in a single FFI call
 //!
 //! Used for PKCE S256 challenge derivation (RFC 7636) and `at_hash`
 //! computation (OIDC Core 1.0, section 3.1.3.6).
@@ -30,6 +10,10 @@ use super::backend::ffi;
 
 /// SHA-256 digest size in bytes.
 pub(crate) const SHA256_OUTPUT_LEN: usize = 32;
+/// SHA-384 digest size in bytes.
+pub(crate) const SHA384_OUTPUT_LEN: usize = 48;
+/// SHA-512 digest size in bytes.
+pub(crate) const SHA512_OUTPUT_LEN: usize = 64;
 
 /// Computes the SHA-256 digest of `data`, returning the 32-byte output.
 ///
@@ -39,19 +23,34 @@ pub(crate) const SHA256_OUTPUT_LEN: usize = 32;
 pub(crate) fn sha256(data: &[u8]) -> [u8; SHA256_OUTPUT_LEN] {
     let mut out = [0u8; SHA256_OUTPUT_LEN];
 
-    // SAFETY: `data` is a valid slice for the duration of the call.
-    // `out` is a writable 32-byte buffer. `SHA256` writes exactly
-    // `SHA256_DIGEST_LENGTH` bytes into `out` and returns a pointer
-    // into `out` on success, or NULL on failure. Both aws-lc and
-    // BoringSSL expose the same signature.
-    //
-    // Failure mode: on aws-lc, `SHA256` may take the FIPS
-    // service-indicator lock; the lock overflow path aborts but the
-    // source itself calls it "impossible on a 64-bit system". Same
-    // theoretical abort risk as `RAND_bytes`. On NULL return we
-    // document the invariant with `assert!` per `AGENTS.md`.
+    // SAFETY: `data` remains readable and `out` remains writable for
+    // the call; `SHA256` writes exactly `SHA256_OUTPUT_LEN` bytes.
     let out_ptr = unsafe { ffi::SHA256(data.as_ptr(), data.len(), out.as_mut_ptr()) };
     assert!(!out_ptr.is_null(), "SHA256 returned NULL");
+
+    out
+}
+
+/// Computes the SHA-384 digest of `data`.
+pub(crate) fn sha384(data: &[u8]) -> [u8; SHA384_OUTPUT_LEN] {
+    let mut out = [0u8; SHA384_OUTPUT_LEN];
+
+    // SAFETY: `data` remains readable and `out` remains writable for
+    // the call; `SHA384` writes exactly `SHA384_OUTPUT_LEN` bytes.
+    let out_ptr = unsafe { ffi::SHA384(data.as_ptr(), data.len(), out.as_mut_ptr()) };
+    assert!(!out_ptr.is_null(), "SHA384 returned NULL");
+
+    out
+}
+
+/// Computes the SHA-512 digest of `data`.
+pub(crate) fn sha512(data: &[u8]) -> [u8; SHA512_OUTPUT_LEN] {
+    let mut out = [0u8; SHA512_OUTPUT_LEN];
+
+    // SAFETY: `data` remains readable and `out` remains writable for
+    // the call; `SHA512` writes exactly `SHA512_OUTPUT_LEN` bytes.
+    let out_ptr = unsafe { ffi::SHA512(data.as_ptr(), data.len(), out.as_mut_ptr()) };
+    assert!(!out_ptr.is_null(), "SHA512 returned NULL");
 
     out
 }
@@ -78,7 +77,7 @@ mod tests {
     //!   block boundary, which is the sharpest edge in the
     //!   length-extension / padding arithmetic
 
-    use super::sha256;
+    use super::{sha256, sha384, sha512};
 
     /// FIPS 180-4 SHA-256 known-answer test vectors:
     ///
@@ -121,6 +120,22 @@ mod tests {
         let a = sha256(b"openid email profile");
         let b = sha256(b"openid email profile");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sha384_known_answer_matches_fips_180_4() {
+        assert_eq!(
+            hex(&sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+        );
+    }
+
+    #[test]
+    fn sha512_known_answer_matches_fips_180_4() {
+        assert_eq!(
+            hex(&sha512(b"abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
     }
 
     /// Lowercase hex of a byte slice. Keeps the test self-contained --

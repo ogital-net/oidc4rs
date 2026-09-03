@@ -8,6 +8,7 @@
 //!   configured client id
 //! - `nonce` matches the second-leg state (caller supplies it)
 //! - `at_hash` over the access token (caller supplies it; hybrid flow)
+//! - `auth_time` freshness when the request used `max_age`
 //! - JWKS `kid` lookup with refresh on miss (combined with alg
 //!   filtering via `AsyncHttpsJwks::select_verification_key`)
 
@@ -33,15 +34,16 @@ pub struct VerifyContext {
     pub access_token: Option<String>,
     /// Client id used as the `azp` value when `aud` is multi-valued.
     pub client_id: Option<String>,
-    /// Clock skew to apply to `exp` / `iat` / `nbf` checks. Defaults
-    /// to zero.
+    /// Clock skew to apply to `exp`, `iat`, `nbf`, and `auth_time`
+    /// checks. Defaults to zero.
     pub clock_skew: Option<Duration>,
+    /// Requested `max_age`. When set, the ID token must contain a
+    /// valid `auth_time` no older than this duration.
+    pub expected_max_age: Option<Duration>,
 }
 
-/// The default algorithm allow-list used when the OP does not
-/// advertise `id_token_signing_alg_values_supported` in its discovery
-/// document. Mirrors the OIDC Core 1.0 JWS `alg` set the spec
-/// guarantees for `id_token`s: RS/PS/ES families plus EdDSA.
+/// The default algorithm allow-list used by [`IdTokenVerifier::new`].
+/// Mirrors the supported asymmetric JWS families.
 /// HS* are deliberately excluded because symmetric algorithms
 /// require a shared secret distribution the RP cannot assume.
 pub const DEFAULT_ALLOWED_ALGS: &[&str] = &[
@@ -78,39 +80,16 @@ impl IdTokenVerifier {
     /// comes from a default-permissive verifier accepting any Core
     /// `alg` the OP happens to rotate to.
     ///
-    /// Precedence:
-    /// - `metadata.id_token_signing_alg_values_supported = Some(vec)`
-    ///   -> verifier accepts only those algs (possibly empty if the
-    ///   OP advertised nothing, in which case every ID token is
-    ///   rejected; this matches `openidconnect-rs`).
-    /// - `metadata.id_token_signing_alg_values_supported = None` ->
-    ///   fallback to [`DEFAULT_ALLOWED_ALGS`].
-    ///
     /// `audience` is the relying party's client id (the `aud` value
     /// the OP is expected to put in the ID token).
     ///
-    /// The expected issuer is the `metadata.issuer` value with any
-    /// trailing slash stripped, so the verifier compares against the
-    /// exact string the OP writes in the `iss` claim. OIDC Core
-    /// 1.0 §2 requires those two values to match byte-for-byte, and
-    /// `url` normalizes a host-only origin like
-    /// `https://idp.example.com` to the slash form
-    /// `https://idp.example.com/`, which would otherwise cause
-    /// `JwtConsumer` to reject a well-formed token.
+    /// The expected issuer preserves the exact `metadata.issuer`
+    /// serialization because OIDC requires a byte-for-byte match.
     pub fn from_metadata(metadata: &ProviderMetadata, audience: impl Into<String>) -> Self {
-        let default_algs: Vec<String> = DEFAULT_ALLOWED_ALGS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let allowed = metadata
-            .id_token_signing_alg_values_supported
-            .clone()
-            .map_or(default_algs, |algs| algs.into_iter().collect());
-        let issuer = strip_trailing_slash(metadata.issuer.as_url().as_str());
         Self {
-            expected_issuer: issuer.to_owned(),
+            expected_issuer: metadata.issuer.as_str().to_owned(),
             expected_audience: audience.into(),
-            allowed_algs: allowed,
+            allowed_algs: metadata.id_token_signing_alg_values_supported.clone(),
         }
     }
 
@@ -166,7 +145,10 @@ impl IdTokenVerifier {
         check_nonce(&claims, ctx)?;
 
         // 7. at_hash.
-        check_at_hash(&claims, ctx, alg_id)?;
+        check_at_hash(&claims, ctx, alg_id, &key)?;
+
+        // 8. auth_time when max_age was requested.
+        check_auth_time(&claims, ctx)?;
 
         Ok(claims)
     }
@@ -182,7 +164,10 @@ impl IdTokenVerifier {
 /// Looks up the signing key via `AsyncHttpsJwks::select_verification_key`.
 /// Refreshes the JWKS on `kid` miss and applies the algorithm-confusion
 /// guard (`kty`/curve matching via `VerificationJwkSelector`).
-async fn resolve_key(jwks: &AsyncHttpsJwks, token: &IdToken) -> Result<JsonWebKey, OidcError> {
+pub(crate) async fn resolve_key(
+    jwks: &AsyncHttpsJwks,
+    token: &IdToken,
+) -> Result<JsonWebKey, OidcError> {
     let key = jwks
         .select_verification_key(token.header_kid.as_deref(), &token.header_alg)
         .await?;
@@ -215,6 +200,8 @@ fn verify_signature_and_claims(
     let mut builder = JwtConsumerBuilder::new()
         .set_expected_issuer(&verifier.expected_issuer)
         .set_expected_audience(true, false, &[verifier.expected_audience.as_str()])
+        .set_require_subject()
+        .set_require_issued_at()
         .set_require_expiration_time();
     if let Some(skew) = ctx.clock_skew {
         builder = builder.set_allowed_clock_skew(skew);
@@ -270,11 +257,63 @@ fn check_nonce(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcError>
     Ok(())
 }
 
+/// Enforces the `auth_time` requirement implied by an authorization
+/// request's `max_age` parameter.
+fn check_auth_time(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcError> {
+    let Some(max_age) = ctx.expected_max_age else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(&claims.to_json()).map_err(|_| {
+        OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
+            "JWT claims could not be inspected",
+        ))
+    })?;
+    let auth_time = value.get("auth_time").ok_or_else(|| {
+        OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
+            "auth_time claim required when max_age was requested",
+        ))
+    })?;
+    let seconds = auth_time.as_u64().ok_or_else(|| {
+        OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
+            "auth_time claim must be a non-negative integer",
+        ))
+    })?;
+    let auth_time = std::time::UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| {
+            OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
+                "auth_time claim is out of range",
+            ))
+        })?;
+    let now = std::time::SystemTime::now();
+    let skew = ctx.clock_skew.unwrap_or_default();
+
+    if now
+        .checked_add(skew)
+        .is_some_and(|latest| auth_time > latest)
+    {
+        return Err(OidcError::InvalidIdToken(
+            jose4rs::jwt::InvalidJwtError::new("auth_time claim is in the future"),
+        ));
+    }
+    if auth_time
+        .checked_add(max_age)
+        .and_then(|deadline| deadline.checked_add(skew))
+        .is_some_and(|deadline| now > deadline)
+    {
+        return Err(OidcError::InvalidIdToken(
+            jose4rs::jwt::InvalidJwtError::new("authentication exceeds requested max_age"),
+        ));
+    }
+    Ok(())
+}
+
 /// Enforces the at_hash rule from SPEC §5 when the claim is present.
 fn check_at_hash(
     claims: &JwtClaims,
     ctx: &VerifyContext,
     alg_id: AlgorithmIdentifier,
+    key: &JsonWebKey,
 ) -> Result<(), OidcError> {
     let Some(at_hash_b64) = claims.string_claim("at_hash") else {
         return Ok(());
@@ -284,30 +323,58 @@ fn check_at_hash(
             "access_token required in VerifyContext to validate at_hash".into(),
         )
     })?;
-    let hash_len = match alg_id {
-        AlgorithmIdentifier::RsaUsingSha384
-        | AlgorithmIdentifier::EcdsaUsingP384CurveAndSha384
-        | AlgorithmIdentifier::RsaPssUsingSha384 => 48,
-        AlgorithmIdentifier::RsaUsingSha512
-        | AlgorithmIdentifier::EcdsaUsingP521CurveAndSha512
-        | AlgorithmIdentifier::RsaPssUsingSha512 => 64,
-        _ => 32,
-    };
-    let digest = crate::crypto::sha256(access_token.as_bytes());
-    let left = &digest[..hash_len.min(digest.len())];
-    let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(left);
+    let expected_b64 = calculate_at_hash(access_token, alg_id, key.curve_name())?;
     if at_hash_b64 != expected_b64 {
         return Err(OidcError::AtHashMismatch);
     }
     Ok(())
 }
 
-/// Strips a single trailing `/` from `s` so a parsed-then-serialized
-/// host-only origin like `https://idp.example.com/` compares
-/// byte-equal to the slash-less form the OP writes in its `iss`
-/// claim. Returns `s` unchanged otherwise.
-fn strip_trailing_slash(s: &str) -> &str {
-    s.strip_suffix('/').unwrap_or(s)
+fn calculate_at_hash(
+    access_token: &str,
+    alg_id: AlgorithmIdentifier,
+    key_curve: Option<&str>,
+) -> Result<String, OidcError> {
+    let token = access_token.as_bytes();
+    let encoded = match alg_id {
+        AlgorithmIdentifier::HmacSha256
+        | AlgorithmIdentifier::RsaUsingSha256
+        | AlgorithmIdentifier::EcdsaUsingP256CurveAndSha256
+        | AlgorithmIdentifier::RsaPssUsingSha256 => {
+            let digest = crate::crypto::sha256(token);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        #[cfg(not(feature = "boring"))]
+        AlgorithmIdentifier::EcdsaUsingSecp256k1CurveAndSha256 => {
+            let digest = crate::crypto::sha256(token);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        AlgorithmIdentifier::HmacSha384
+        | AlgorithmIdentifier::RsaUsingSha384
+        | AlgorithmIdentifier::EcdsaUsingP384CurveAndSha384
+        | AlgorithmIdentifier::RsaPssUsingSha384 => {
+            let digest = crate::crypto::sha384(token);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        AlgorithmIdentifier::HmacSha512
+        | AlgorithmIdentifier::RsaUsingSha512
+        | AlgorithmIdentifier::EcdsaUsingP521CurveAndSha512
+        | AlgorithmIdentifier::RsaPssUsingSha512 => {
+            let digest = crate::crypto::sha512(token);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        AlgorithmIdentifier::EdDsa if key_curve == Some("Ed25519") => {
+            let digest = crate::crypto::sha512(token);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        AlgorithmIdentifier::None | AlgorithmIdentifier::EdDsa => {
+            return Err(OidcError::UnsupportedAlgorithm(format!(
+                "{} does not identify an at_hash digest",
+                alg_id.name()
+            )));
+        }
+    };
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -320,6 +387,7 @@ mod tests {
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
     use serde_json::json;
+    use sha2::Digest as _;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -418,6 +486,46 @@ mod tests {
         let ctx = VerifyContext::default();
         let parsed = verifier().verify(&token, &jwks, &ctx).await.unwrap();
         assert_eq!(parsed.subject().unwrap(), "user-42");
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_subject() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        let jwt = sign_id_token(&priv_key, &claims);
+        let token = IdToken::parse(&jwt).unwrap();
+        let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_issued_at() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "sub": "user-42",
+            "exp": iat + 3600,
+        });
+        let jwt = sign_id_token(&priv_key, &claims);
+        let token = IdToken::parse(&jwt).unwrap();
+        let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
     }
 
     #[tokio::test]
@@ -565,12 +673,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enforces_auth_time_when_max_age_requested() {
+        let (priv_key, jwk) = make_keypair();
+        let iat = now();
+        let jwks = build_jwks(&jwk);
+        let ctx = VerifyContext {
+            expected_max_age: Some(Duration::from_secs(300)),
+            clock_skew: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let base = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+
+        for auth_time in [
+            None,
+            Some(json!("invalid")),
+            Some(json!(iat - 3600)),
+            Some(json!(iat + 3600)),
+        ] {
+            let mut claims = base.clone();
+            if let Some(auth_time) = auth_time {
+                claims["auth_time"] = auth_time;
+            }
+            let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+            let err = verifier().verify(&token, &jwks, &ctx).await.unwrap_err();
+            assert!(matches!(err, OidcError::InvalidIdToken(_)));
+        }
+
+        let mut claims = base;
+        claims["auth_time"] = json!(iat - 120);
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        verifier().verify(&token, &jwks, &ctx).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn validates_at_hash_when_present() {
         let (priv_key, jwk) = make_keypair();
         let iat = now();
         let access_token = "AT-VALUE-123";
-        let digest = crate::crypto::sha256(access_token.as_bytes());
-        let at_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..32]);
+        let digest = sha2::Sha256::digest(access_token.as_bytes());
+        let at_hash =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2]);
         let claims = json!({
             "iss": "https://idp.example.com",
             "aud": "my-client",
@@ -588,6 +736,37 @@ mod tests {
         };
         let parsed = verifier().verify(&token, &jwks, &ctx).await.unwrap();
         assert_eq!(parsed.subject().unwrap(), "user-1");
+    }
+
+    #[test]
+    fn at_hash_uses_jws_hash_family_and_left_half() {
+        let access_token = "AT-VALUE-123";
+        let sha256 = sha2::Sha256::digest(access_token.as_bytes());
+        let sha384 = sha2::Sha384::digest(access_token.as_bytes());
+        let sha512 = sha2::Sha512::digest(access_token.as_bytes());
+        let encode_left = |digest: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        };
+
+        assert_eq!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::RsaUsingSha256, None).unwrap(),
+            encode_left(&sha256)
+        );
+        assert_eq!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::RsaUsingSha384, None).unwrap(),
+            encode_left(&sha384)
+        );
+        assert_eq!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::RsaUsingSha512, None).unwrap(),
+            encode_left(&sha512)
+        );
+        assert_eq!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::EdDsa, Some("Ed25519")).unwrap(),
+            encode_left(&sha512)
+        );
+        assert!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::EdDsa, Some("Ed448")).is_err()
+        );
     }
 
     #[tokio::test]
@@ -613,7 +792,7 @@ mod tests {
         assert!(matches!(err, OidcError::AtHashMismatch));
     }
 
-    fn metadata_with_algs(algs: Option<Vec<String>>) -> ProviderMetadata {
+    fn metadata_with_algs(algs: Vec<String>) -> ProviderMetadata {
         ProviderMetadata {
             issuer: IssuerUrl::from_str("https://idp.example.com").unwrap(),
             authorization_endpoint: AuthUrl::from_str("https://idp.example.com/authorize").unwrap(),
@@ -624,10 +803,11 @@ mod tests {
             registration_endpoint: None,
             scopes_supported: None,
             response_types_supported: vec!["code".into()],
-            subject_types_supported: None,
+            subject_types_supported: vec!["public".into()],
             id_token_signing_alg_values_supported: algs,
             grant_types_supported: None,
             token_endpoint_auth_methods_supported: None,
+            authorization_response_iss_parameter_supported: false,
             userinfo_signing_alg_values_supported: None,
             extra: serde_json::Map::new(),
         }
@@ -635,19 +815,16 @@ mod tests {
 
     #[test]
     fn from_metadata_narrows_to_advertised_subset() {
-        let meta = metadata_with_algs(Some(vec!["RS256".into(), "ES256".into()]));
+        let meta = metadata_with_algs(vec!["RS256".into(), "ES256".into()]);
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
         assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ES256".to_owned()]);
-        // OIDC Core §2 requires the `iss` claim to match the issuer
-        // URL the OP advertises; we strip the slash that `url`
-        // appends so the verifier compares byte-equal to the OP.
         assert_eq!(v.issuer(), "https://idp.example.com");
         assert_eq!(v.audience(), "my-client");
     }
 
     #[test]
     fn from_metadata_preserves_issuer_with_path() {
-        let meta = metadata_with_algs(Some(vec!["RS256".into()]));
+        let meta = metadata_with_algs(vec!["RS256".into()]);
         // Issuer with a non-trivial path -- no slash stripping needed.
         let meta = ProviderMetadata {
             issuer: IssuerUrl::from_str("https://idp.example.com/op").unwrap(),
@@ -658,36 +835,23 @@ mod tests {
     }
 
     #[test]
-    fn from_metadata_strips_trailing_slash_from_already_slashed_issuer() {
-        let meta = metadata_with_algs(Some(vec!["RS256".into()]));
+    fn from_metadata_preserves_trailing_slash() {
+        let meta = metadata_with_algs(vec!["RS256".into()]);
         let meta = ProviderMetadata {
             issuer: IssuerUrl::from_str("https://idp.example.com/").unwrap(),
             ..meta
         };
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
-        // Idempotent: an issuer that already has a trailing slash
-        // loses it once, not repeatedly.
-        assert_eq!(v.issuer(), "https://idp.example.com");
-    }
-
-    #[test]
-    fn from_metadata_falls_back_to_core_default_when_field_absent() {
-        let meta = metadata_with_algs(None);
-        let v = IdTokenVerifier::from_metadata(&meta, "my-client");
-        let expected: Vec<String> = DEFAULT_ALLOWED_ALGS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        assert_eq!(v.allowed_algs(), expected.as_slice());
+        assert_eq!(v.issuer(), "https://idp.example.com/");
     }
 
     #[test]
     fn from_metadata_preserves_op_advertised_empty_list() {
-        // Some(empty) means the OP explicitly advertised nothing;
+        // An empty list means the OP explicitly advertised nothing;
         // honor that as "reject every alg" so a misconfigured OP
         // surfaces as a hard verification failure rather than
         // silently passing.
-        let meta = metadata_with_algs(Some(vec![]));
+        let meta = metadata_with_algs(vec![]);
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
         assert!(v.allowed_algs().is_empty());
     }
@@ -699,7 +863,7 @@ mod tests {
         // entry against the jose4rs enum. The downstream
         // `AlgorithmIdentifier::try_from` in `check_alg` is what
         // surfaces an unsupported alg to the caller.
-        let meta = metadata_with_algs(Some(vec!["RS256".into(), "ZZ999".into()]));
+        let meta = metadata_with_algs(vec!["RS256".into(), "ZZ999".into()]);
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
         assert_eq!(v.allowed_algs(), &["RS256".to_owned(), "ZZ999".to_owned()]);
     }

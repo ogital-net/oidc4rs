@@ -13,6 +13,9 @@ pub enum CallbackError {
         description: Option<String>,
     },
 
+    #[error("authorization response issuer mismatch: expected {expected}, got {actual}")]
+    IssuerMismatch { expected: String, actual: String },
+
     #[error("failed to parse redirect: {0}")]
     Parse(String),
 }

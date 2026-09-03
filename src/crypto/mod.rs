@@ -6,7 +6,7 @@
 //!
 //! - Secure random byte generation, used for nonces, state values, PKCE
 //!   verifiers, and KV keys.
-//! - SHA-256, used for PKCE S256 challenge derivation and `at_hash`
+//! - SHA-2, used for PKCE S256 challenge derivation and `at_hash`
 //!   computation.
 //!
 //! Both operations call into the same FFI backend the consumer selected
@@ -23,5 +23,5 @@ mod hash;
 mod rand;
 
 pub(crate) use ct::ct_equals;
-pub(crate) use hash::sha256;
+pub(crate) use hash::{sha256, sha384, sha512};
 pub(crate) use rand::fill_bytes;

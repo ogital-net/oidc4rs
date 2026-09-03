@@ -13,7 +13,7 @@
 //! in the second-leg KV.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use url::Url;
 
@@ -33,6 +33,7 @@ pub struct AuthRequestState {
     pub state: State,
     pub nonce: Nonce,
     pub pkce_verifier: Option<PkceCodeVerifier>,
+    pub max_age: Option<Duration>,
     pub redirect_uri: RedirectUrl,
     pub scopes: Scope,
     pub authorization_url: Url,
@@ -53,6 +54,7 @@ impl AuthRequestState {
             state: self.state.as_str().to_owned(),
             nonce: self.nonce.as_str().to_owned(),
             pkce_verifier: self.pkce_verifier.as_ref().map(|v| v.as_str().to_owned()),
+            max_age: self.max_age,
             redirect_uri: Some(self.redirect_uri.as_str().to_owned()),
             scopes: self.scopes.iter().map(str::to_owned).collect(),
             created_at: std::time::SystemTime::now(),
@@ -69,6 +71,8 @@ pub struct PendingAuthRequest {
     pub state: String,
     pub nonce: String,
     pub pkce_verifier: Option<String>,
+    #[serde(default)]
+    pub max_age: Option<Duration>,
     pub redirect_uri: Option<String>,
     pub scopes: Vec<String>,
     pub created_at: std::time::SystemTime,
@@ -79,6 +83,16 @@ impl PendingAuthRequest {
 
     pub fn key_for(state: &str) -> String {
         format!("oidc4rs:pending:{state}")
+    }
+
+    pub(crate) fn validate_created_at(&self, now: SystemTime) -> Result<(), OidcError> {
+        let age = now
+            .duration_since(self.created_at)
+            .map_err(|_| OidcError::PendingAuthorizationFromFuture)?;
+        if age > Self::DEFAULT_TTL {
+            return Err(OidcError::PendingAuthorizationExpired);
+        }
+        Ok(())
     }
 }
 
@@ -129,13 +143,21 @@ impl AuthorizeUrlBuilder {
             q.append_pair("scope", scope.as_str());
         }
 
+        let (pkce_verifier, pkce_challenge) = if client.client_secret.is_none() {
+            let verifier = PkceCodeVerifier::new_random();
+            let challenge = PkceCodeChallenge::s256_from_verifier(&verifier);
+            (Some(verifier), Some(challenge))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             client,
             url,
             state: State::new_random(),
             nonce: Nonce::new_random(),
-            pkce_verifier: None,
-            pkce_challenge: None,
+            pkce_verifier,
+            pkce_challenge,
             response_mode: None,
             prompt: None,
             max_age: None,
@@ -155,8 +177,8 @@ impl AuthorizeUrlBuilder {
         self
     }
 
-    /// Adds PKCE using the S256 method. Generates a fresh verifier and
-    /// derives the challenge from it.
+    /// Adds PKCE using the S256 method. Public clients use S256 by
+    /// default; calling this method replaces the generated verifier.
     pub fn pkce_s256(mut self) -> Self {
         let verifier = PkceCodeVerifier::new_random();
         let challenge = PkceCodeChallenge::s256_from_verifier(&verifier);
@@ -269,6 +291,7 @@ impl AuthorizeUrlBuilder {
             state: self.state,
             nonce: self.nonce,
             pkce_verifier: self.pkce_verifier,
+            max_age: self.max_age,
             redirect_uri: self.redirect_uri,
             scopes: self.scopes,
             authorization_url: url,
@@ -362,10 +385,11 @@ mod tests {
             registration_endpoint: None,
             scopes_supported: None,
             response_types_supported: vec!["code".into()],
-            subject_types_supported: None,
-            id_token_signing_alg_values_supported: None,
+            subject_types_supported: vec!["public".into()],
+            id_token_signing_alg_values_supported: vec!["RS256".into()],
             grant_types_supported: None,
             token_endpoint_auth_methods_supported: None,
+            authorization_response_iss_parameter_supported: false,
             userinfo_signing_alg_values_supported: None,
             extra: serde_json::Map::new(),
         }
@@ -463,6 +487,20 @@ mod tests {
     }
 
     #[test]
+    fn public_client_uses_pkce_by_default() {
+        let state = test_client()
+            .authorize(test_redirect_uri(), test_scope())
+            .unwrap()
+            .build();
+        let pairs: std::collections::HashMap<_, _> =
+            state.authorization_url.query_pairs().into_owned().collect();
+
+        assert_eq!(pairs.get("code_challenge_method"), Some(&"S256".to_owned()));
+        assert!(pairs.contains_key("code_challenge"));
+        assert!(state.pkce_verifier.is_some());
+    }
+
+    #[test]
     fn pkce_challenge_matches_verifier() {
         let client = test_client();
         let state = client
@@ -493,6 +531,8 @@ mod tests {
             state.authorization_url.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("prompt"), Some(&"login".to_owned()));
         assert_eq!(pairs.get("max_age"), Some(&"300".to_owned()));
+        assert_eq!(state.max_age, Some(Duration::from_secs(300)));
+        assert_eq!(state.to_pending().max_age, state.max_age);
     }
 
     #[test]
@@ -506,6 +546,7 @@ mod tests {
         let pairs: std::collections::HashMap<_, _> =
             state.authorization_url.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("max_age"), Some(&"0".to_owned()));
+        assert_eq!(state.max_age, Some(Duration::ZERO));
     }
 
     #[test]

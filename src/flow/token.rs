@@ -51,32 +51,40 @@ impl TokenAuthMethod {
         }
     }
 
-    /// Picks the most-preferred method from the OP-discovered list.
-    /// Falls back to `client_secret_basic` when the list is empty.
-    pub fn from_metadata(supported: Option<&[String]>, has_secret: bool) -> Self {
+    /// Picks the most-preferred compatible method from discovery.
+    /// Falls back to `client_secret_basic` when the field is absent.
+    pub fn from_metadata(
+        supported: Option<&[String]>,
+        has_secret: bool,
+    ) -> Result<Self, OidcError> {
         let Some(supported) = supported else {
-            return if has_secret {
+            return Ok(if has_secret {
                 Self::ClientSecretBasic
             } else {
                 Self::None
-            };
+            });
         };
         let wants_basic = supported.iter().any(|m| m == "client_secret_basic");
         let wants_post = supported.iter().any(|m| m == "client_secret_post");
         let wants_none = supported.iter().any(|m| m == "none");
-        if has_secret {
+        let method = if has_secret {
             if wants_basic {
                 Self::ClientSecretBasic
             } else if wants_post {
                 Self::ClientSecretPost
             } else {
-                Self::ClientSecretBasic
+                return Err(OidcError::InvalidMetadata(
+                    "provider advertises no supported client authentication method".into(),
+                ));
             }
         } else if wants_none {
             Self::None
         } else {
-            Self::ClientSecretBasic
-        }
+            return Err(OidcError::InvalidMetadata(
+                "provider does not advertise unauthenticated token requests".into(),
+            ));
+        };
+        Ok(method)
     }
 }
 
@@ -173,6 +181,9 @@ impl CodeTokenRequest {
                 "redirect_uri is required".into(),
             ));
         }
+        if method == TokenAuthMethod::None && self.pkce_verifier.is_none() {
+            return Err(OidcError::MissingPkceVerifier);
+        }
 
         let mut form: Vec<(&str, &str)> =
             vec![("grant_type", "authorization_code"), ("code", &self.code)];
@@ -183,7 +194,6 @@ impl CodeTokenRequest {
             form.push(("code_verifier", v));
         }
 
-        let body = form_encode(&form);
         let endpoint_str = self.endpoint.to_string();
         let mut headers: Vec<(String, String)> = vec![
             ("Accept".into(), "application/json".into()),
@@ -195,11 +205,11 @@ impl CodeTokenRequest {
 
         match method {
             TokenAuthMethod::ClientSecretBasic => {
-                let creds = format!(
-                    "{}:{}",
-                    self.client_id.as_str(),
+                let client_id = form_encode_component(self.client_id.as_str());
+                let client_secret = form_encode_component(
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 );
+                let creds = format!("{client_id}:{client_secret}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
                 headers.push(("Authorization".into(), format!("Basic {encoded}")));
             }
@@ -209,21 +219,11 @@ impl CodeTokenRequest {
                     "client_secret",
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 ));
-                // Re-encode with the auth fields included.
-                let body = form_encode(&form);
-                return Ok(BuiltTokenRequest {
-                    url: self.endpoint,
-                    http: HttpRequest {
-                        method: HttpMethod::Post,
-                        url: endpoint_str,
-                        headers,
-                        body: Some(body.into_bytes()),
-                    },
-                });
             }
-            TokenAuthMethod::None => {}
+            TokenAuthMethod::None => form.push(("client_id", self.client_id.as_str())),
         }
 
+        let body = form_encode(&form);
         Ok(BuiltTokenRequest {
             url: self.endpoint,
             http: HttpRequest {
@@ -315,11 +315,11 @@ impl RefreshTokenRequest {
 
         match method {
             TokenAuthMethod::ClientSecretBasic => {
-                let creds = format!(
-                    "{}:{}",
-                    self.client_id.as_str(),
+                let client_id = form_encode_component(self.client_id.as_str());
+                let client_secret = form_encode_component(
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 );
+                let creds = format!("{client_id}:{client_secret}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
                 headers.push(("Authorization".into(), format!("Basic {encoded}")));
             }
@@ -330,7 +330,7 @@ impl RefreshTokenRequest {
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 ));
             }
-            TokenAuthMethod::None => {}
+            TokenAuthMethod::None => form.push(("client_id", self.client_id.as_str())),
         }
 
         let body = form_encode(&form);
@@ -352,6 +352,15 @@ fn form_encode(form: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form.iter().copied())
         .finish()
+}
+
+fn form_encode_component(value: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("", value)
+        .finish()
+        .strip_prefix('=')
+        .expect("form serialization of an empty key starts with '='")
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -446,7 +455,7 @@ mod tests {
             .build()
             .unwrap();
         let body = String::from_utf8(req.http.body.clone().unwrap()).unwrap();
-        assert!(!body.contains("client_id="));
+        assert!(body.contains("client_id=my-client"));
         assert!(!body.contains("client_secret="));
         assert!(req.http.headers.iter().all(|(k, _)| k != "Authorization"));
     }
@@ -487,6 +496,12 @@ mod tests {
     }
 
     #[test]
+    fn code_request_none_requires_pkce() {
+        let err = code_req_none().build().unwrap_err();
+        assert!(matches!(err, OidcError::MissingPkceVerifier));
+    }
+
+    #[test]
     fn refresh_request_basic_auth() {
         let req = RefreshTokenRequest::new(
             endpoint(),
@@ -517,6 +532,44 @@ mod tests {
         .unwrap();
         let body = String::from_utf8(req.http.body.clone().unwrap()).unwrap();
         assert!(body.contains("scope=openid+email"));
+        assert!(body.contains("client_id=my-client"));
+    }
+
+    #[test]
+    fn basic_auth_form_encodes_each_credential() {
+        let req = CodeTokenRequest::new(
+            endpoint(),
+            ClientId::new("client:id / ").unwrap(),
+            Some(crate::types::ClientSecret::new("s:e& c+%").unwrap()),
+            "auth-code".to_owned(),
+            Some(TokenAuthMethod::ClientSecretBasic),
+        )
+        .redirect_uri("https://app.example.com/cb")
+        .build()
+        .unwrap();
+        let header = req
+            .http
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.1.trim_start_matches("Basic "))
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "client%3Aid+%2F+:s%3Ae%26+c%2B%25"
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_incompatible_auth_methods() {
+        let private_only = vec!["private_key_jwt".to_owned()];
+        let basic_only = vec!["client_secret_basic".to_owned()];
+
+        assert!(TokenAuthMethod::from_metadata(Some(&private_only), true).is_err());
+        assert!(TokenAuthMethod::from_metadata(Some(&basic_only), false).is_err());
     }
 
     #[test]

@@ -4,20 +4,103 @@
 //! are supported:
 //!
 //! - **Unsigned JSON**: claims serialized as a plain JSON object.
-//! - **Signed JWT**: claims serialized as a JWS in compact form.
-//!   When the OP advertises `userinfo_signing_alg_values_supported`
-//!   in its discovery document the JWT path is strongly recommended;
-//!   [`UserInfo::from_signed_jwt`] enforces the same issuer /
-//!   audience / signature / algorithm checks as the ID-token path.
+//! - **Signed JWT**: claims serialized as a JWS in compact form and
+//!   checked using the provider's UserInfo signing policy.
 
 use std::collections::HashMap;
 
-use base64::Engine;
 use jose4rs::jwk::AsyncHttpsJwks;
+use jose4rs::jws::{AlgorithmIdentifier, JsonWebSignature};
+use jose4rs::jwt::{InvalidJwtError, JwtConsumerBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::OidcError;
-use crate::token::verify::{IdTokenVerifier, VerifyContext};
+use crate::metadata::ProviderMetadata;
+use crate::token::verify::DEFAULT_ALLOWED_ALGS;
+
+/// Validation policy for signed UserInfo responses.
+pub struct UserInfoVerifier {
+    expected_issuer: String,
+    expected_audience: String,
+    allowed_algs: Vec<String>,
+}
+
+impl UserInfoVerifier {
+    /// Creates a verifier with the crate's conservative asymmetric
+    /// signing algorithm defaults.
+    pub fn new(expected_issuer: impl Into<String>, expected_audience: impl Into<String>) -> Self {
+        Self {
+            expected_issuer: expected_issuer.into(),
+            expected_audience: expected_audience.into(),
+            allowed_algs: DEFAULT_ALLOWED_ALGS
+                .iter()
+                .map(|alg| (*alg).to_owned())
+                .collect(),
+        }
+    }
+
+    /// Creates a verifier from the provider's UserInfo algorithm list.
+    pub fn from_metadata(metadata: &ProviderMetadata, audience: impl Into<String>) -> Self {
+        let default_algs = DEFAULT_ALLOWED_ALGS
+            .iter()
+            .map(|alg| (*alg).to_owned())
+            .collect();
+        Self {
+            expected_issuer: metadata.issuer.as_str().to_owned(),
+            expected_audience: audience.into(),
+            allowed_algs: metadata
+                .userinfo_signing_alg_values_supported
+                .clone()
+                .unwrap_or(default_algs),
+        }
+    }
+
+    /// Replaces the accepted signing algorithm list.
+    pub fn with_allowed_algs(mut self, algs: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_algs = algs.into_iter().collect();
+        self
+    }
+
+    /// Returns the accepted signing algorithms.
+    pub fn allowed_algs(&self) -> &[String] {
+        &self.allowed_algs
+    }
+
+    async fn verify(
+        &self,
+        compact_jws: &str,
+        jwks: &AsyncHttpsJwks,
+    ) -> Result<UserInfo, OidcError> {
+        let token = crate::token::response::IdToken::parse(compact_jws)?;
+        if !self
+            .allowed_algs
+            .iter()
+            .any(|allowed| allowed == &token.header_alg)
+        {
+            return Err(OidcError::UnsupportedAlgorithm(token.header_alg));
+        }
+        AlgorithmIdentifier::try_from(token.header_alg.as_str())
+            .map_err(|error| OidcError::UnsupportedAlgorithm(error.to_string()))?;
+        let key = crate::token::verify::resolve_key(jwks, &token).await?;
+        let jws = JsonWebSignature::from_compact_serialization(compact_jws)?;
+        if !jws.verify_signature(&key)? {
+            return Err(OidcError::InvalidUserInfoJwt(InvalidJwtError::new(
+                "JWS signature is invalid",
+            )));
+        }
+        let payload = jws.payload(&key)?;
+        let payload = std::str::from_utf8(payload).map_err(|_| {
+            OidcError::InvalidUserInfoJwt(InvalidJwtError::new("JWT payload is not valid UTF-8"))
+        })?;
+        JwtConsumerBuilder::new()
+            .set_expected_issuer(&self.expected_issuer)
+            .set_expected_audience(true, false, &[self.expected_audience.as_str()])
+            .build()
+            .process_to_claims(payload)
+            .map_err(OidcError::InvalidUserInfoJwt)?;
+        serde_json::from_str(payload).map_err(OidcError::from)
+    }
+}
 
 /// Standard Claims from OIDC Core 1.0 section 5.4 plus the §5.1.1
 /// profile (email / phone / address) claims that the userinfo
@@ -88,41 +171,25 @@ impl UserInfo {
         serde_json::from_slice(bytes).map_err(OidcError::from)
     }
 
+    /// Verifies that this response describes the ID-token subject.
+    pub fn verify_subject(&self, expected_subject: &str) -> Result<(), OidcError> {
+        if self.sub != expected_subject {
+            return Err(OidcError::UserInfoSubjectMismatch);
+        }
+        Ok(())
+    }
+
     /// Parses and verifies a signed (JWS compact) userinfo response.
     ///
-    /// Runs the same signature / issuer / audience / `exp` / algorithm
-    /// checks as the ID-token path. The supplied `verifier` is
-    /// reused -- callers construct one `IdTokenVerifier` per relying
-    /// party and pass it to both `verify_id_token` and
-    /// `from_signed_jwt`.
-    ///
-    /// Note: `at_hash`, `nonce`, and `azp` (multi-aud) rules are
-    /// only enforced when the corresponding fields appear in the
-    /// JWT, mirroring the ID-token semantics.
+    /// Validates the signature, required `iss` and `aud` claims, and
+    /// any time claims that are present. UserInfo does not require an
+    /// `exp` or `iat` claim.
     pub async fn from_signed_jwt(
         compact_jws: &str,
-        verifier: &IdTokenVerifier,
+        verifier: &UserInfoVerifier,
         jwks: &AsyncHttpsJwks,
     ) -> Result<Self, OidcError> {
-        // IdToken::parse handles compact-serialization splitting,
-        // base64 decoding, and UTF-8 validation for both header
-        // and payload. The verifier below re-runs the same decode
-        // for signature + claim checks. After the verifier
-        // succeeds, we re-decode the payload segment to obtain the
-        // raw JSON for UserInfo.
-        let token = crate::token::response::IdToken::parse(compact_jws)?;
-        let ctx = VerifyContext::default();
-        let _claims = verifier.verify(&token, jwks, &ctx).await?;
-        let payload_b64 = compact_jws
-            .split('.')
-            .nth(1)
-            .ok_or_else(|| OidcError::InvalidAuthorizationRequest("malformed JWS".into()))?;
-        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload_b64)
-            .map_err(OidcError::from)?;
-        let payload_str = std::str::from_utf8(&payload_bytes)
-            .map_err(|_| OidcError::InvalidAuthorizationRequest("JWS payload not UTF-8".into()))?;
-        serde_json::from_str(payload_str).map_err(OidcError::from)
+        verifier.verify(compact_jws, jwks).await
     }
 }
 
@@ -200,8 +267,8 @@ mod tests {
         encode(&header, claims, &key).expect("encode")
     }
 
-    fn verifier() -> IdTokenVerifier {
-        IdTokenVerifier::new(ISS, AUD)
+    fn verifier() -> UserInfoVerifier {
+        UserInfoVerifier::new(ISS, AUD)
     }
 
     fn now() -> i64 {
@@ -279,6 +346,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_signed_jwt_accepts_response_without_time_claims() {
+        let (priv_key, jwk) = make_keypair();
+        let claims = json!({
+            "iss": ISS,
+            "aud": AUD,
+            "sub": "user-42",
+            "name": "Ada",
+        });
+        let jwt = sign(&priv_key, &claims);
+        let jwks = build_jwks(&jwk);
+
+        let info = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
+            .await
+            .unwrap();
+        assert_eq!(info.sub, "user-42");
+    }
+
+    #[tokio::test]
     async fn from_signed_jwt_rejects_bad_issuer() {
         let (priv_key, jwk) = make_keypair();
         let iat = now();
@@ -294,7 +379,7 @@ mod tests {
         let err = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
             .await
             .unwrap_err();
-        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+        assert!(matches!(err, OidcError::InvalidUserInfoJwt(_)));
     }
 
     #[tokio::test]
@@ -313,7 +398,7 @@ mod tests {
         let err = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
             .await
             .unwrap_err();
-        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+        assert!(matches!(err, OidcError::InvalidUserInfoJwt(_)));
     }
 
     #[tokio::test]
@@ -332,7 +417,7 @@ mod tests {
         let err = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
             .await
             .unwrap_err();
-        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+        assert!(matches!(err, OidcError::InvalidUserInfoJwt(_)));
     }
 
     #[tokio::test]
@@ -353,7 +438,7 @@ mod tests {
         let err = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
             .await
             .unwrap_err();
-        assert!(matches!(err, OidcError::InvalidIdToken(_)));
+        assert!(matches!(err, OidcError::InvalidUserInfoJwt(_)));
     }
 
     #[tokio::test]
@@ -379,14 +464,10 @@ mod tests {
         )
         .unwrap();
         let jwks = build_jwks(&jwk);
-        let err = UserInfo::from_signed_jwt(&jwt, &verifier(), &jwks)
+        let verifier = verifier().with_allowed_algs(["RS256".to_owned()]);
+        let err = UserInfo::from_signed_jwt(&jwt, &verifier, &jwks)
             .await
             .unwrap_err();
-        // Either the alg allow-list or the JWK alg restriction is
-        // an acceptable rejection path.
-        assert!(
-            matches!(err, OidcError::UnsupportedAlgorithm(ref a) if a == "RS384")
-                || matches!(err, OidcError::Jose(_))
-        );
+        assert!(matches!(err, OidcError::UnsupportedAlgorithm(ref alg) if alg == "RS384"));
     }
 }

@@ -211,10 +211,11 @@ mod tests {
             registration_endpoint: None,
             scopes_supported: None,
             response_types_supported: vec!["code".into()],
-            subject_types_supported: None,
-            id_token_signing_alg_values_supported: None,
+            subject_types_supported: vec!["public".into()],
+            id_token_signing_alg_values_supported: vec!["RS256".into()],
             grant_types_supported: None,
             token_endpoint_auth_methods_supported: None,
+            authorization_response_iss_parameter_supported: false,
             userinfo_signing_alg_values_supported: None,
             extra: serde_json::Map::new(),
         }

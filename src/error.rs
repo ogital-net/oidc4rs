@@ -37,6 +37,12 @@ pub enum OidcError {
         error_description: Option<String>,
     },
 
+    #[error("signed UserInfo validation failed: {0}")]
+    InvalidUserInfoJwt(jose4rs::jwt::InvalidJwtError),
+
+    #[error("UserInfo subject does not match the ID-token subject")]
+    UserInfoSubjectMismatch,
+
     #[error("JOSE error: {0}")]
     Jose(#[from] jose4rs::error::JoseError),
 
@@ -69,6 +75,12 @@ pub enum OidcError {
 
     #[error("expected PKCE challenge on pending request")]
     UnexpectedPkce,
+
+    #[error("pending authorization request has expired")]
+    PendingAuthorizationExpired,
+
+    #[error("pending authorization request timestamp is in the future")]
+    PendingAuthorizationFromFuture,
 }
 
 impl From<crate::transport::kv::KvError> for OidcError {
