@@ -38,6 +38,16 @@ serde_json = "1"
 thiserror = "2"
 url = "2"
 
+# Optional hyper-based `AsyncHttpClient` implementation, gated behind
+# the `hyper` feature (see [features] below and AGENTS.md's Async
+# section for the tokio exception this pulls in transitively).
+hyper = { version = "1", optional = true, features = ["http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["client", "client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["aws-lc-rs", "http1", "native-tokio", "rustls-native-certs", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+
 [features]
 default = ["aws-lc"]
 
@@ -58,6 +68,18 @@ boring = [
     "jose4rs/boring",
     "jose4rs/base64-simd",
     "jose4rs/jwks-https-async",
+]
+
+# `transport::hyper_client::HyperHttpClient`, a hyper + hyper-rustls
+# `AsyncHttpClient` implementation. Requires a tokio runtime at call
+# sites since hyper-util's connector is tokio-based; see AGENTS.md.
+hyper = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:rustls",
+    "dep:http-body-util",
+    "dep:bytes",
 ]
 
 [dev-dependencies]

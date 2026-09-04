@@ -123,6 +123,7 @@ src/
   transport/
     mod.rs
     http.rs              AsyncHttpClient trait + request/response types
+    hyper_client.rs      optional hyper + hyper-rustls AsyncHttpClient (`hyper` feature)
     kv.rs                AsyncKvStore trait for second-leg state
   metadata/
     mod.rs
@@ -171,7 +172,13 @@ being compared is the cryptographic nonce, not user input.
 ## 6. HTTP / KV Transport
 
 Both are traits with `BoxFuture<'_, T>` returns. The crate ships no
-default implementation; examples provide `reqwest` adapters.
+default `AsyncKvStore`; examples provide `reqwest` adapters for
+`AsyncHttpClient`. An optional `AsyncHttpClient` implementation,
+`transport::hyper_client::HyperHttpClient`, ships behind the `hyper`
+feature for callers who want a built-in client instead of wiring
+`reqwest` themselves. It depends on a tokio runtime at call sites;
+see AGENTS.md's Async section for why this is an accepted exception
+to the crate's no-tokio-in-dependencies rule.
 
 ## 7. Coding Conventions
 
@@ -211,6 +218,7 @@ children once their parent is done.
 
 - [x] `transport::http::AsyncHttpClient` trait + `HttpRequest` / `HttpResponse`
 - [x] `transport::kv::AsyncKvStore` trait + `KvError`
+- [x] `transport::hyper_client::HyperHttpClient` -- optional hyper + hyper-rustls `AsyncHttpClient` behind the `hyper` feature
 
 ### 8.5 Metadata and discovery
 
@@ -257,6 +265,7 @@ children once their parent is done.
 - [ ] `examples/reqwest_adapter.rs` showing the HTTP / KV trait impls
 - [ ] `examples/refresh_token.rs`
 - [x] `examples/logout.rs`
+- [x] `examples/hyper_adapter.rs` showing the `hyper` feature's `AsyncHttpClient`
 - [ ] `examples/custom_claims.rs`
 - [ ] Top-level `README.md` with quickstart
 

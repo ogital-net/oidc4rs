@@ -66,6 +66,13 @@ rationale.
   = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;`.
 - No `tokio` / `async-std` / `smol` in `[dependencies]`. Callers wire
   their own runtime; `examples/` show the wiring for `reqwest` + tokio.
+  Exception: the optional `hyper` feature
+  (`transport::hyper_client::HyperHttpClient`) depends on
+  `hyper-util`'s tokio-based connector, because no maintained
+  runtime-agnostic TCP/TLS connector exists for hyper. This is an
+  opt-in `AsyncHttpClient` implementation, not a runtime the rest of
+  the crate depends on; callers who do not enable `hyper` are
+  unaffected.
 
 ## Errors
 
