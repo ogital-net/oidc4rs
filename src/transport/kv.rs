@@ -5,42 +5,220 @@
 //! lands on instance B. B needs the `state`, `nonce`, PKCE verifier, and
 //! `redirect_uri` A generated. A shared KV store is the standard bridge.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KvError {
-    #[error("key not found")]
-    NotFound,
+    #[error("time-to-live must be greater than zero and representable")]
+    InvalidTtl,
 
     #[error("storage backend error: {0}")]
     Storage(String),
 }
 
-/// Async key-value store.
+/// Async key-value store for short-lived, single-use values.
 ///
 /// Semantics:
-/// - `get` returns `Ok(None)` for missing keys; `Err` is reserved for
-///   transport / backend failures.
-/// - `put` with `ttl = None` means "no expiration". Callers should always
-///   provide a TTL for OIDC pending state.
-/// - `delete` is idempotent. Callers MUST delete after consuming a
-///   pending entry to prevent replay.
+/// - `put_if_absent` atomically creates a value with a bounded lifetime.
+///   It returns `false` without changing the stored value when the key exists.
+/// - `take` atomically removes and returns a value. Concurrent calls for the
+///   same key must return the value at most once.
+/// - Missing and expired keys return `Ok(None)` from `take`; `Err` is reserved
+///   for transport or backend failures.
 pub trait AsyncKvStore: Send + Sync {
-    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, KvError>>;
-
-    fn put<'a>(
+    fn put_if_absent<'a>(
         &'a self,
         key: &'a str,
         value: Vec<u8>,
-        ttl: Option<Duration>,
-    ) -> BoxFuture<'a, Result<(), KvError>>;
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<bool, KvError>>;
 
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>>;
+    fn take<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, KvError>>;
+}
+
+/// Process-local [`AsyncKvStore`] backed by a mutex-protected [`HashMap`].
+///
+/// This store is suitable for a single application instance. It is not shared
+/// across processes, so deployments with multiple instances must use a shared
+/// implementation whose operations provide the same atomic semantics. Clones
+/// are inexpensive handles to the same process-local entries.
+#[derive(Clone, Default)]
+pub struct InMemoryKvStore {
+    entries: Arc<Mutex<HashMap<String, InMemoryEntry>>>,
+}
+
+struct InMemoryEntry {
+    value: Vec<u8>,
+    expires_at: Instant,
+}
+
+impl InMemoryKvStore {
+    /// Creates an empty process-local store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl AsyncKvStore for InMemoryKvStore {
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<bool, KvError>> {
+        Box::pin(async move {
+            if ttl.is_zero() {
+                return Err(KvError::InvalidTtl);
+            }
+            let now = Instant::now();
+            let expires_at = now.checked_add(ttl).ok_or(KvError::InvalidTtl)?;
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| KvError::Storage("in-memory store lock poisoned".into()))?;
+            entries.retain(|_, entry| entry.expires_at > now);
+            match entries.entry(key.to_owned()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(InMemoryEntry { value, expires_at });
+                    Ok(true)
+                }
+                Entry::Occupied(_) => Ok(false),
+            }
+        })
+    }
+
+    fn take<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, KvError>> {
+        Box::pin(async move {
+            let entry = self
+                .entries
+                .lock()
+                .map_err(|_| KvError::Storage("in-memory store lock poisoned".into()))?
+                .remove(key);
+            Ok(entry
+                .filter(|entry| entry.expires_at > Instant::now())
+                .map(|entry| entry.value))
+        })
+    }
 }
 
 // `From<KvError> for OidcError` lives in `error.rs` to keep the conversion
 // next to the enum definition (see AGENTS.md "Errors").
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    #[test]
+    fn value_is_created_once_and_taken_once() {
+        futures::executor::block_on(async {
+            let store = InMemoryKvStore::new();
+            assert!(
+                store
+                    .put_if_absent("key", b"first".to_vec(), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .put_if_absent("key", b"second".to_vec(), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(store.take("key").await.unwrap(), Some(b"first".to_vec()));
+            assert_eq!(store.take("key").await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn clones_share_entries() {
+        futures::executor::block_on(async {
+            let store = InMemoryKvStore::new();
+            let clone = store.clone();
+            assert!(
+                clone
+                    .put_if_absent("key", b"value".to_vec(), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(store.take("key").await.unwrap(), Some(b"value".to_vec()));
+            assert_eq!(clone.take("key").await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn expired_value_is_unavailable_and_replaceable() {
+        futures::executor::block_on(async {
+            let store = InMemoryKvStore::new();
+            assert!(
+                store
+                    .put_if_absent("key", b"expired".to_vec(), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
+            store
+                .entries
+                .lock()
+                .unwrap()
+                .get_mut("key")
+                .unwrap()
+                .expires_at = Instant::now();
+
+            assert!(
+                store
+                    .put_if_absent("key", b"fresh".to_vec(), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(store.take("key").await.unwrap(), Some(b"fresh".to_vec()));
+        });
+    }
+
+    #[test]
+    fn concurrent_take_returns_value_once() {
+        let store = InMemoryKvStore::new();
+        assert!(
+            futures::executor::block_on(store.put_if_absent(
+                "key",
+                b"value".to_vec(),
+                Duration::from_secs(60),
+            ))
+            .unwrap()
+        );
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    futures::executor::block_on(store.take("key")).unwrap()
+                })
+            })
+            .collect();
+
+        let values: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(values.iter().filter(|value| value.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn zero_ttl_is_rejected() {
+        let result = futures::executor::block_on(InMemoryKvStore::new().put_if_absent(
+            "key",
+            Vec::new(),
+            Duration::ZERO,
+        ));
+        assert!(matches!(result, Err(KvError::InvalidTtl)));
+    }
+}

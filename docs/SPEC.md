@@ -171,9 +171,15 @@ being compared is the cryptographic nonce, not user input.
 
 ## 6. HTTP / KV Transport
 
-Both are traits with `BoxFuture<'_, T>` returns. The crate ships no
-default `AsyncKvStore`; examples provide `reqwest` adapters for
-`AsyncHttpClient`. An optional `AsyncHttpClient` implementation,
+Both are traits with `BoxFuture<'_, T>` returns. `AsyncKvStore` exposes
+create-if-absent with a TTL and atomic take operations. The built-in
+`InMemoryKvStore` uses a mutex-protected hash map for single-instance
+applications. Multi-instance applications provide a shared implementation;
+for example, Redis-compatible stores map the operations to `SET NX EX` and
+`GETDEL`.
+
+Examples provide `reqwest` adapters for `AsyncHttpClient`. An optional
+`AsyncHttpClient` implementation,
 `transport::hyper_client::HyperHttpClient`, ships behind the `hyper`
 feature for callers who want a built-in client instead of wiring
 `reqwest` themselves. It depends on a tokio runtime at call sites;
@@ -217,7 +223,7 @@ children once their parent is done.
 ### 8.4 Transport
 
 - [x] `transport::http::AsyncHttpClient` trait + `HttpRequest` / `HttpResponse`
-- [x] `transport::kv::AsyncKvStore` trait + `KvError`
+- [x] `transport::kv::AsyncKvStore` trait + `KvError` + `InMemoryKvStore`
 - [x] `transport::hyper_client::HyperHttpClient` -- optional hyper + hyper-rustls `AsyncHttpClient` behind the `hyper` feature
 
 ### 8.5 Metadata and discovery
@@ -387,7 +393,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 | Feature | Status | Notes |
 |---|---|---|
 | `AsyncHttpClient` trait | Already | `transport::http` |
-| `AsyncKvStore` trait | Already | `transport::kv` |
+| `AsyncKvStore` trait | Already | Atomic create and take; built-in process-local adapter |
 | Examples wiring reqwest + Redis-like adapters | Partial | SPEC §8.9 pending |
 | Direct FFI to aws-lc / boring, no `ring`/`sha2`/`rand_core` in public types | Already | Unique to oidc4rs |
 

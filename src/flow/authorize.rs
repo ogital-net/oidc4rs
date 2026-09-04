@@ -325,7 +325,11 @@ impl Client {
     ///     .pkce_s256()
     ///     .prompt(AuthPrompt::Login)
     ///     .build();
-    /// kv.put(&state.storage_key(), &state.to_pending()).await?;
+    /// kv.put_if_absent(
+    ///     &state.storage_key(),
+    ///     serde_json::to_vec(&state.to_pending())?,
+    ///     PendingAuthRequest::DEFAULT_TTL,
+    /// ).await?;
     /// redirect_to(state.authorization_url);
     /// ```
     pub fn authorize(

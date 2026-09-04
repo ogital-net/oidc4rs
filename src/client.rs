@@ -108,12 +108,11 @@ impl Client {
     ///
     /// Behavior:
     /// 1. Parses the callback.
-    /// 2. Looks up the pending request by `state`.
+    /// 2. Atomically consumes the pending request by `state`.
     /// 3. Verifies the `state` matches (CSRF defense).
     /// 4. Rejects stale or future-dated pending requests.
     /// 5. POSTs the token request, including PKCE verifier if any.
-    /// 6. Deletes the pending entry to prevent replay.
-    /// 7. Returns the parsed [`TokenResponse`] plus the pending request
+    /// 6. Returns the parsed [`TokenResponse`] plus the pending request
     ///    snapshot for downstream logic (e.g. nonce verification).
     ///
     /// The ID-token verification step is *not* performed here. Callers
@@ -142,9 +141,12 @@ impl Client {
         }
         let key = PendingAuthRequest::key_for(&response.state);
 
-        let raw = kv.get(&key).await?.ok_or(OidcError::AuthorizationResponse(
-            crate::flow::callback::CallbackError::Missing("state"),
-        ))?;
+        let raw = kv
+            .take(&key)
+            .await?
+            .ok_or(OidcError::AuthorizationResponse(
+                crate::flow::callback::CallbackError::Missing("state"),
+            ))?;
         let pending: PendingAuthRequest = serde_json::from_slice(&raw)?;
 
         if pending.state != response.state {
@@ -154,10 +156,7 @@ impl Client {
                 ),
             ));
         }
-        if let Err(error) = pending.validate_created_at(std::time::SystemTime::now()) {
-            let _ = kv.delete(&key).await;
-            return Err(error);
-        }
+        pending.validate_created_at(std::time::SystemTime::now())?;
 
         let mut builder: CodeTokenRequest = self.exchange_code(response.code.clone())?;
         if let Some(uri) = pending.redirect_uri.as_deref() {
@@ -168,10 +167,6 @@ impl Client {
         }
         let built = builder.build()?;
         let token_response = post_token_request(&*self.http, &built).await?;
-
-        // Best-effort cleanup. A failed delete must not mask a successful
-        // exchange; the pending entry's TTL is the safety net.
-        let _ = kv.delete(&key).await;
 
         Ok(CompleteAuthorization {
             token_response,
@@ -538,25 +533,32 @@ mod tests {
                 data: Mutex::new(HashMap::new()),
             }
         }
+
+        fn contains(&self, key: &str) -> bool {
+            self.data.lock().unwrap().contains_key(key)
+        }
     }
 
     impl AsyncKvStore for MockKv {
-        fn get(&self, key: &str) -> KvBoxFuture<'_, Result<Option<Vec<u8>>, KvError>> {
-            let v = self.data.lock().unwrap().get(key).cloned();
-            Box::pin(async move { Ok(v) })
-        }
-        fn put(
+        fn put_if_absent(
             &self,
             key: &str,
             value: Vec<u8>,
-            _ttl: Option<std::time::Duration>,
-        ) -> KvBoxFuture<'_, Result<(), KvError>> {
-            self.data.lock().unwrap().insert(key.to_owned(), value);
-            Box::pin(async move { Ok(()) })
+            _ttl: std::time::Duration,
+        ) -> KvBoxFuture<'_, Result<bool, KvError>> {
+            let inserted = match self.data.lock().unwrap().entry(key.to_owned()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            };
+            Box::pin(async move { Ok(inserted) })
         }
-        fn delete(&self, key: &str) -> KvBoxFuture<'_, Result<(), KvError>> {
-            self.data.lock().unwrap().remove(key);
-            Box::pin(async move { Ok(()) })
+
+        fn take(&self, key: &str) -> KvBoxFuture<'_, Result<Option<Vec<u8>>, KvError>> {
+            let value = self.data.lock().unwrap().remove(key);
+            Box::pin(async move { Ok(value) })
         }
     }
 
@@ -589,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_authorization_exchanges_code_and_deletes_pending() {
+    async fn complete_authorization_exchanges_code_and_consumes_pending() {
         let token_resp = serde_json::json!({
             "access_token": "AT-1",
             "token_type": "Bearer",
@@ -623,13 +625,15 @@ mod tests {
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
         };
-        kv.put(
-            &PendingAuthRequest::key_for(state),
-            serde_json::to_vec(&pending).unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
+        assert!(
+            kv.put_if_absent(
+                &PendingAuthRequest::key_for(state),
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
 
         let query = format!("code=AUTH-CODE&state={state}");
         let result = client.complete_authorization(&query, &kv).await.unwrap();
@@ -647,9 +651,8 @@ mod tests {
         assert_eq!(result.callback_state, state);
         assert_eq!(result.pending.nonce, "nonce-abc");
 
-        // Pending entry deleted.
-        let still = kv.get(&PendingAuthRequest::key_for(state)).await.unwrap();
-        assert!(still.is_none());
+        // Pending entry consumed.
+        assert!(!kv.contains(&PendingAuthRequest::key_for(state)));
 
         // Last request was a POST with form body containing grant_type=authorization_code.
         let last = http.last_request.lock().unwrap().clone().unwrap();
@@ -661,6 +664,58 @@ mod tests {
         assert!(body.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb"));
         // client_secret_basic puts creds in header, not body.
         assert!(last.headers.iter().any(|(k, _)| k == "Authorization"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_completion_consumes_pending_once() {
+        let token_resp = serde_json::json!({
+            "access_token": "AT-1",
+            "token_type": "Bearer",
+            "id_token": "header.payload.signature",
+        })
+        .to_string()
+        .into_bytes();
+        let http = Arc::new(MockHttp::new(vec![HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: token_resp,
+        }]));
+        let client = Client::from_parts(
+            provider_metadata(),
+            ClientId::new("my-client").unwrap(),
+            Some(ClientSecret::new("secret").unwrap()),
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let kv = MockKv::new();
+        let state = "single-use-state";
+        let pending = PendingAuthRequest {
+            state: state.into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &PendingAuthRequest::key_for(state),
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
+        let query = format!("code=AUTH-CODE&state={state}");
+
+        let (first, second) = futures::join!(
+            client.complete_authorization(&query, &kv),
+            client.complete_authorization(&query, &kv),
+        );
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(!kv.contains(&PendingAuthRequest::key_for(state)));
     }
 
     #[tokio::test]
@@ -684,13 +739,15 @@ mod tests {
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
         };
-        kv.put(
-            &PendingAuthRequest::key_for("real-state"),
-            serde_json::to_vec(&pending).unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
+        assert!(
+            kv.put_if_absent(
+                &PendingAuthRequest::key_for("real-state"),
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
 
         let query = "code=AUTH-CODE&state=other-state";
         let err = client.complete_authorization(query, &kv).await.unwrap_err();
@@ -733,9 +790,15 @@ mod tests {
                 created_at,
             };
             let key = PendingAuthRequest::key_for(state);
-            kv.put(&key, serde_json::to_vec(&pending).unwrap(), None)
+            assert!(
+                kv.put_if_absent(
+                    &key,
+                    serde_json::to_vec(&pending).unwrap(),
+                    PendingAuthRequest::DEFAULT_TTL,
+                )
                 .await
-                .unwrap();
+                .unwrap()
+            );
 
             let query = format!("code=AUTH-CODE&state={state}");
             let error = client
@@ -746,7 +809,7 @@ mod tests {
                 std::mem::discriminant(&error),
                 std::mem::discriminant(&expected)
             );
-            assert!(kv.get(&key).await.unwrap().is_none());
+            assert!(!kv.contains(&key));
         }
     }
 
@@ -832,13 +895,15 @@ mod tests {
             scopes: vec!["openid".into()],
             created_at: std::time::SystemTime::now(),
         };
-        kv.put(
-            &PendingAuthRequest::key_for(state),
-            serde_json::to_vec(&pending).unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
+        assert!(
+            kv.put_if_absent(
+                &PendingAuthRequest::key_for(state),
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
 
         let query = format!("code=CODE&state={state}");
         let err = client
