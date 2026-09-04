@@ -6,7 +6,7 @@ use jose4rs::jwk::{AsyncHttpsJwks, AsyncJwksFetcher, FetchResponse};
 
 use crate::error::OidcError;
 use crate::flow::authorize::PendingAuthRequest;
-use crate::flow::callback::parse_authorization_response;
+use crate::flow::callback::{AuthorizationResponse, CallbackError, parse_authorization_response};
 use crate::flow::token::{BuiltTokenRequest, CodeTokenRequest, RefreshTokenRequest};
 use crate::metadata::ProviderMetadata;
 use crate::token::response::{IdToken, TokenResponse};
@@ -109,9 +109,10 @@ impl Client {
     /// Behavior:
     /// 1. Parses the callback.
     /// 2. Atomically consumes the pending request by `state`.
-    /// 3. Verifies the `state` matches (CSRF defense).
-    /// 4. Rejects stale or future-dated pending requests.
-    /// 5. POSTs the token request, including PKCE verifier if any.
+    /// 3. Verifies the `state` matches and the request is current.
+    /// 4. Returns a provider error after consuming its pending request.
+    /// 5. Otherwise delegates to
+    ///    [`complete_authorization_from_pending`](Self::complete_authorization_from_pending).
     /// 6. Returns the parsed [`TokenResponse`] plus the pending request
     ///    snapshot for downstream logic (e.g. nonce verification).
     ///
@@ -125,8 +126,29 @@ impl Client {
         kv: &dyn AsyncKvStore,
     ) -> Result<CompleteAuthorization, OidcError> {
         let response = parse_authorization_response(callback_query)?;
+        let pending = take_pending_request(kv, response.state()).await?;
+        self.complete_authorization_from_pending(response, pending)
+            .await
+    }
+
+    /// Completes an authorization-code flow from state the caller has already
+    /// consumed atomically.
+    ///
+    /// Use this entry point when the stored transaction contains application
+    /// context needed to select the client, such as a tenant or provider ID.
+    /// The caller consumes and decodes its transaction, resolves this client,
+    /// then passes the embedded [`PendingAuthRequest`] here. This method still
+    /// validates the callback issuer, state binding, and pending-request age
+    /// before making the token request.
+    pub async fn complete_authorization_from_pending(
+        &self,
+        response: AuthorizationResponse,
+        pending: PendingAuthRequest,
+    ) -> Result<CompleteAuthorization, OidcError> {
+        let callback_state = response.state().to_owned();
+        validate_pending_request(&pending, &callback_state)?;
         let expected_issuer = self.metadata.issuer.as_str();
-        match response.iss.as_deref() {
+        match response.issuer() {
             Some(actual) if actual != expected_issuer => {
                 return Err(crate::flow::callback::CallbackError::IssuerMismatch {
                     expected: expected_issuer.to_owned(),
@@ -139,26 +161,28 @@ impl Client {
             }
             Some(_) | None => {}
         }
-        let key = PendingAuthRequest::key_for(&response.state);
 
-        let raw = kv
-            .take(&key)
-            .await?
-            .ok_or(OidcError::AuthorizationResponse(
-                crate::flow::callback::CallbackError::Missing("state"),
-            ))?;
-        let pending: PendingAuthRequest = serde_json::from_slice(&raw)?;
+        let code = match response {
+            AuthorizationResponse::Success { code, .. } => code,
+            AuthorizationResponse::Error {
+                error,
+                description,
+                error_uri,
+                iss,
+                ..
+            } => {
+                return Err(CallbackError::ProviderError {
+                    error,
+                    description,
+                    error_uri,
+                    state: callback_state,
+                    iss,
+                }
+                .into());
+            }
+        };
 
-        if pending.state != response.state {
-            return Err(OidcError::AuthorizationResponse(
-                crate::flow::callback::CallbackError::Parse(
-                    "state mismatch between callback and pending entry".into(),
-                ),
-            ));
-        }
-        pending.validate_created_at(std::time::SystemTime::now())?;
-
-        let mut builder: CodeTokenRequest = self.exchange_code(response.code.clone())?;
+        let mut builder: CodeTokenRequest = self.exchange_code(code)?;
         if let Some(uri) = pending.redirect_uri.as_deref() {
             builder = builder.redirect_uri(uri);
         }
@@ -171,7 +195,7 @@ impl Client {
         Ok(CompleteAuthorization {
             token_response,
             pending,
-            callback_state: response.state,
+            callback_state,
         })
     }
 
@@ -325,6 +349,32 @@ impl Client {
     pub fn build_end_session_url(&self) -> crate::flow::logout::EndSessionUrlBuilder<'_> {
         crate::flow::logout::EndSessionUrlBuilder::new(self)
     }
+}
+
+async fn take_pending_request(
+    kv: &dyn AsyncKvStore,
+    state: &str,
+) -> Result<PendingAuthRequest, OidcError> {
+    let key = PendingAuthRequest::key_for(state);
+    let raw = kv
+        .take(&key)
+        .await?
+        .ok_or(OidcError::AuthorizationResponse(CallbackError::Missing(
+            "state",
+        )))?;
+    serde_json::from_slice(&raw).map_err(Into::into)
+}
+
+fn validate_pending_request(
+    pending: &PendingAuthRequest,
+    callback_state: &str,
+) -> Result<(), OidcError> {
+    if pending.state != callback_state {
+        return Err(OidcError::AuthorizationResponse(CallbackError::Parse(
+            "state mismatch between callback and pending entry".into(),
+        )));
+    }
+    pending.validate_created_at(std::time::SystemTime::now())
 }
 
 /// Result of [`Client::complete_authorization`].
@@ -667,6 +717,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_authorization_from_pending_exchanges_without_store() {
+        let token_resp = serde_json::json!({
+            "access_token": "AT-1",
+            "token_type": "Bearer",
+            "id_token": "header.payload.signature",
+        })
+        .to_string()
+        .into_bytes();
+        let http = Arc::new(MockHttp::new(vec![HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: token_resp,
+        }]));
+        let client = Client::from_parts(
+            provider_metadata(),
+            ClientId::new("my-client").unwrap(),
+            Some(ClientSecret::new("secret").unwrap()),
+            http,
+        )
+        .unwrap();
+        let response = AuthorizationResponse::Success {
+            code: "AUTH-CODE".into(),
+            state: "consumed-state".into(),
+            iss: None,
+        };
+        let pending = PendingAuthRequest {
+            state: "consumed-state".into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+
+        let result = client
+            .complete_authorization_from_pending(response, pending)
+            .await
+            .unwrap();
+
+        assert_eq!(result.callback_state, "consumed-state");
+        assert_eq!(result.token_response.access_token.as_str(), "AT-1");
+    }
+
+    #[tokio::test]
+    async fn provider_error_consumes_pending_state() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let client = Client::from_parts(
+            provider_metadata(),
+            ClientId::new("my-client").unwrap(),
+            Some(ClientSecret::new("secret").unwrap()),
+            http,
+        )
+        .unwrap();
+        let kv = MockKv::new();
+        let state = "denied-state";
+        let key = PendingAuthRequest::key_for(state);
+        let pending = PendingAuthRequest {
+            state: state.into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &key,
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
+
+        let error = client
+            .complete_authorization(
+                "error=access_denied&error_uri=https%3A%2F%2Fop.example.com%2Fdenied&state=denied-state&iss=https%3A%2F%2Fidp.example.com",
+                &kv,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OidcError::AuthorizationResponse(CallbackError::ProviderError {
+                error,
+                error_uri: Some(error_uri),
+                state,
+                iss: Some(iss),
+                ..
+            }) if error == "access_denied"
+                && error_uri == "https://op.example.com/denied"
+                && state == "denied-state"
+                && iss == "https://idp.example.com"
+        ));
+        assert!(!kv.contains(&key));
+    }
+
+    #[tokio::test]
+    async fn provider_error_rejects_wrong_callback_issuer_after_consuming_state() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let mut metadata = provider_metadata();
+        metadata.authorization_response_iss_parameter_supported = true;
+        let client = Client::from_parts(
+            metadata,
+            ClientId::new("my-client").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let kv = MockKv::new();
+        let state = "denied-state";
+        let key = PendingAuthRequest::key_for(state);
+        let pending = PendingAuthRequest {
+            state: state.into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &key,
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
+
+        let error = client
+            .complete_authorization(
+                "error=access_denied&state=denied-state&iss=https%3A%2F%2Fattacker.example.com",
+                &kv,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OidcError::AuthorizationResponse(CallbackError::IssuerMismatch { .. })
+        ));
+        assert!(!kv.contains(&key));
+    }
+
+    #[tokio::test]
+    async fn provider_error_requires_advertised_callback_issuer_after_consuming_state() {
+        let http = Arc::new(MockHttp::new(vec![]));
+        let mut metadata = provider_metadata();
+        metadata.authorization_response_iss_parameter_supported = true;
+        let client = Client::from_parts(
+            metadata,
+            ClientId::new("my-client").unwrap(),
+            None,
+            http as Arc<dyn AsyncHttpClient>,
+        )
+        .unwrap();
+        let kv = MockKv::new();
+        let state = "denied-state";
+        let key = PendingAuthRequest::key_for(state);
+        let pending = PendingAuthRequest {
+            state: state.into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &key,
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
+
+        let error = client
+            .complete_authorization("error=access_denied&state=denied-state", &kv)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OidcError::AuthorizationResponse(CallbackError::Missing("iss"))
+        ));
+        assert!(!kv.contains(&key));
+    }
+
+    #[tokio::test]
     async fn concurrent_completion_consumes_pending_once() {
         let token_resp = serde_json::json!({
             "access_token": "AT-1",
@@ -825,11 +1071,31 @@ mod tests {
             http as Arc<dyn AsyncHttpClient>,
         )
         .unwrap();
+        let kv = MockKv::new();
+        let key = PendingAuthRequest::key_for("state-1");
+        let pending = PendingAuthRequest {
+            state: "state-1".into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &key,
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
 
         let err = client
             .complete_authorization(
                 "code=AUTH-CODE&state=state-1&iss=https%3A%2F%2Fattacker.example.com",
-                &MockKv::new(),
+                &kv,
             )
             .await
             .unwrap_err();
@@ -839,6 +1105,7 @@ mod tests {
                 crate::flow::callback::CallbackError::IssuerMismatch { .. }
             )
         ));
+        assert!(!kv.contains(&key));
     }
 
     #[tokio::test]
@@ -853,15 +1120,36 @@ mod tests {
             http as Arc<dyn AsyncHttpClient>,
         )
         .unwrap();
+        let kv = MockKv::new();
+        let key = PendingAuthRequest::key_for("state-1");
+        let pending = PendingAuthRequest {
+            state: "state-1".into(),
+            nonce: "nonce".into(),
+            pkce_verifier: None,
+            max_age: None,
+            redirect_uri: Some("https://app.example.com/cb".into()),
+            scopes: vec!["openid".into()],
+            created_at: std::time::SystemTime::now(),
+        };
+        assert!(
+            kv.put_if_absent(
+                &key,
+                serde_json::to_vec(&pending).unwrap(),
+                PendingAuthRequest::DEFAULT_TTL,
+            )
+            .await
+            .unwrap()
+        );
 
         let err = client
-            .complete_authorization("code=AUTH-CODE&state=state-1", &MockKv::new())
+            .complete_authorization("code=AUTH-CODE&state=state-1", &kv)
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             OidcError::AuthorizationResponse(crate::flow::callback::CallbackError::Missing("iss"))
         ));
+        assert!(!kv.contains(&key));
     }
 
     #[tokio::test]

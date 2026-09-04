@@ -163,6 +163,27 @@ ID-token verification (in `token::verify::IdTokenVerifier::verify`):
 | JWKS `kid` lookup | `jose4rs::jwk::VerificationJwkSelector` |
 | JWKS refresh on unknown `kid` | `jose4rs::jwk::AsyncHttpsJwks` |
 
+Authorization-response validation (in `flow::callback` and the `Client`
+completion methods):
+
+| Check | Source of truth |
+|---|---|
+| Successful `code` response or OP `error` response, never both | OIDC Core 1.0 sections 3.1.2.5 through 3.1.2.7; RFC 6749 sections 4.1.2 and 4.1.2.1 |
+| Unique response parameter names, including unknown extensions | RFC 6749 section 3.1 |
+| Empty response values treated as omitted | RFC 6749 section 3.1 |
+| Unknown response parameters ignored | RFC 6749 section 4.1.2 |
+| `code`, `state`, `error`, `error_description`, and `error_uri` character sets | RFC 6749 appendix A |
+| `state` required and atomically consumed for success and OP errors | RFC 6749 sections 4.1.2, 4.1.2.1, and 10.12; every oidc4rs authorization request includes `state` |
+| Present `iss` exactly matches discovery `issuer` on success and OP errors | RFC 9207 section 2.4 |
+| Missing `iss` rejected when support is advertised | RFC 9207 sections 2.3 and 2.4 |
+
+For a provider that does not advertise RFC 9207 support, oidc4rs accepts a
+missing `iss` for legacy interoperability. If such a provider sends `iss`
+anyway, oidc4rs accepts it only when it exactly matches the discovery issuer.
+This is the RFC 9207 section 2.4 local-policy allowance for providers that
+send the parameter without advertising it. A parsed `AuthorizationResponse`
+is not trusted until a `Client` completion method validates this binding.
+
 Nonce comparison is performed via constant-time equality on the
 SHA-256 digests of the two strings (rather than the strings
 themselves) to defeat timing oracles that recover the secret
@@ -249,6 +270,7 @@ children once their parent is done.
 - [x] `flow::logout` -- expose `Client::build_end_session_url` wrapping `EndSessionUrlBuilder` (see section 9.7)
 - [x] `flow::logout::EndSessionUrlBuilder` -- add `client_id`, `logout_hint`, `ui_locales` (see section 9.7)
 - [x] `Client::complete_authorization` second-leg helper
+- [x] `Client::complete_authorization_from_pending` for applications that consume state before resolving a provider-specific client
 - [x] `Client::exchange_refresh_token`
 
 ### 8.8 Token verification
@@ -313,7 +335,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 | Authorization-code exchange | Already | `Client::exchange_code` + `CodeTokenRequest` |
 | Refresh-token exchange | Already | `Client::exchange_refresh_token` + `RefreshTokenRequest` |
 | Basic and body client auth | Already | `TokenAuthMethod::from_metadata` |
-| PKCE verifier on the wire | Already | wired through `complete_authorization` |
+| PKCE verifier on the wire | Already | wired through both authorization completion methods |
 | ROPC / Client Credentials / Device Code | Defer | Spec section 2 |
 | Token Exchange (RFC 8693) | Defer | Spec section 2 |
 
@@ -383,8 +405,9 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 
 | Feature | Status | Notes |
 |---|---|---|
-| `code` / `state` / `iss` | Already | `parse_authorization_response` |
-| `error` / `error_description` | Already | `CallbackError::ProviderError` |
+| `code` / `state` / `iss` | Already | `parse_authorization_response`; RFC 6749 syntax and RFC 9207 issuer checks |
+| `error` / `error_description` / `error_uri` / `state` | Already | `CallbackError::ProviderError`; the store-backed flow validates and consumes returned state |
+| Duplicate, empty, mixed-outcome, and unknown parameters | Already | RFC 6749 sections 3.1 and 4.1.2 |
 | Auto-detect query vs fragment at the string level | Add | Both clones accept either; we require the caller to strip the leading `?`/`#` |
 | Snapshot tests | Add | SPEC §8.10 already calls this out |
 
