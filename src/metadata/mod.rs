@@ -1,21 +1,49 @@
 //! OpenID Provider metadata and discovery.
 
+use std::time::Duration;
+
+/// HTTP response cache policy for discovery metadata.
+mod cache;
 pub mod provider;
 
+pub(crate) use cache::CachePolicy;
 pub use provider::ProviderMetadata;
-
-use jose4rs::jwk::JsonWebKeySet;
 
 use crate::error::OidcError;
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::types::IssuerUrl;
 
-/// Performs OIDC discovery: fetches `/.well-known/openid-configuration`
-/// and the OP JWKS, validates the issuer, and returns both.
-pub async fn discover<C>(
+/// Discovery metadata paired with its HTTP response cache policy.
+pub(crate) struct DiscoveredMetadata {
+    pub(crate) metadata: ProviderMetadata,
+    response_headers: Vec<(String, String)>,
+}
+
+impl DiscoveredMetadata {
+    /// Derives cache policy using the caller's current duration settings.
+    pub(crate) fn cache_policy(
+        &self,
+        default_lifetime: Duration,
+        minimum_cache_duration: Duration,
+    ) -> CachePolicy {
+        let policy = cache::policy_from_headers(&self.response_headers, default_lifetime);
+        cache::apply_minimum_cache_duration(policy, minimum_cache_duration)
+    }
+}
+
+/// Fetches and validates the OP's discovery metadata.
+pub async fn discover<C>(issuer: IssuerUrl, http: &C) -> Result<ProviderMetadata, OidcError>
+where
+    C: AsyncHttpClient + ?Sized,
+{
+    Ok(discover_with_cache(issuer, http).await?.metadata)
+}
+
+/// Fetches discovery metadata and retains its response cache headers.
+pub(crate) async fn discover_with_cache<C>(
     issuer: IssuerUrl,
     http: &C,
-) -> Result<(ProviderMetadata, JsonWebKeySet), OidcError>
+) -> Result<DiscoveredMetadata, OidcError>
 where
     C: AsyncHttpClient + ?Sized,
 {
@@ -59,23 +87,8 @@ where
         )));
     }
 
-    let jwks_req = HttpRequest {
-        method: HttpMethod::Get,
-        url: metadata.jwks_uri.as_str().to_owned(),
-        headers: vec![("Accept".into(), "application/json".into())],
-        body: None,
-    };
-    let jwks_resp = http
-        .execute(jwks_req)
-        .await
-        .map_err(|e| OidcError::Discovery(format!("jwks: {e}")))?;
-    if jwks_resp.status != 200 {
-        return Err(OidcError::Discovery(format!(
-            "jwks HTTP {} from {}",
-            jwks_resp.status, metadata.jwks_uri
-        )));
-    }
-    let keys = JsonWebKeySet::from_json(&jwks_resp.body)?;
-
-    Ok((metadata, keys))
+    Ok(DiscoveredMetadata {
+        metadata,
+        response_headers: resp.headers,
+    })
 }

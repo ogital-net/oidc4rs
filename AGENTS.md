@@ -88,9 +88,8 @@ rationale.
 - Pin to major versions; allow minor bumps (`"1"` not `"1.2"`).
 - Every new dependency must justify itself in the PR description. If
   `std` or an existing dependency covers it, do not add it.
-- The `jose4rs` dependency is pinned to upstream `main` via a git
-  rev. Refresh the rev when upstream changes; switch to a crates.io
-  version once a release that includes the required APIs ships.
+- The `jose4rs` dependency tracks a crates.io release line. Use a git
+  revision only when an unreleased API is required.
 
 ## Testing
 
