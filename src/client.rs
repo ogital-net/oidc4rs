@@ -1,7 +1,9 @@
 //! `Client` -- the high-level entry point for an OIDC relying party.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
+use futures_util::lock::Mutex as AsyncMutex;
 use jose4rs::jwk::{AsyncHttpsJwks, AsyncJwksFetcher, FetchResponse};
 
 use crate::error::OidcError;
@@ -14,20 +16,47 @@ use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::transport::kv::AsyncKvStore;
 use crate::types::{AccessToken, ClientId, ClientSecret, RefreshToken};
 
+/// Default interval between successful provider metadata fetches.
+pub const DEFAULT_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// OIDC relying-party client.
 #[allow(clippy::struct_field_names)] // `Client.client_id` / `Client.client_secret` are the standard names.
 pub struct Client {
-    pub(crate) metadata: ProviderMetadata,
+    provider: RwLock<ProviderState>,
+    metadata_refresh_interval: RwLock<Option<Duration>>,
+    metadata_refresh_lock: AsyncMutex<()>,
     pub(crate) client_id: ClientId,
     pub(crate) client_secret: Option<ClientSecret>,
-    pub(crate) jwks: AsyncHttpsJwks,
     pub(crate) http: Arc<dyn AsyncHttpClient>,
+}
+
+/// Metadata and keys must change as one snapshot when `jwks_uri` changes.
+#[derive(Clone)]
+struct ProviderState {
+    metadata: Arc<ProviderMetadata>,
+    jwks: AsyncHttpsJwks,
+    refresh_after: Option<Instant>,
+}
+
+impl ProviderState {
+    fn metadata_is_fresh(&self) -> bool {
+        self.refresh_after
+            .is_none_or(|deadline| Instant::now() < deadline)
+    }
+}
+
+/// An unrepresentable deadline is treated as immediately stale.
+fn metadata_refresh_deadline(interval: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(interval).unwrap_or(now)
 }
 
 impl Client {
     /// Performs discovery from `issuer` and returns a fully wired
     /// `Client`. Fetches the initial JWKS through the same cache used
-    /// for future refreshes.
+    /// for future refreshes. Provider metadata remains fresh for
+    /// [`DEFAULT_METADATA_REFRESH_INTERVAL`] and is then refreshed by
+    /// async client operations or an explicit stale check.
     pub async fn discover<C>(
         issuer: crate::types::IssuerUrl,
         client_id: ClientId,
@@ -43,17 +72,25 @@ impl Client {
         jwks.keys().await?;
 
         Ok(Self {
-            metadata,
+            provider: RwLock::new(ProviderState {
+                metadata: Arc::new(metadata),
+                jwks,
+                refresh_after: Some(metadata_refresh_deadline(DEFAULT_METADATA_REFRESH_INTERVAL)),
+            }),
+            metadata_refresh_interval: RwLock::new(Some(DEFAULT_METADATA_REFRESH_INTERVAL)),
+            metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
-            jwks,
             http,
         })
     }
 
     /// Manual construction for tests or for callers that load metadata
-    /// via a non-HTTP path. The caller is responsible for ensuring the
-    /// JWKS endpoint is reachable; the cache will populate on first use.
+    /// via a non-HTTP path. Automatic metadata refresh starts disabled;
+    /// callers can enable it with
+    /// [`set_metadata_refresh_interval`](Self::set_metadata_refresh_interval).
+    /// The caller is responsible for ensuring the JWKS endpoint is reachable;
+    /// the key cache will populate on first use.
     pub fn from_parts(
         metadata: ProviderMetadata,
         client_id: ClientId,
@@ -65,23 +102,51 @@ impl Client {
         let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
 
         Ok(Self {
-            metadata,
+            provider: RwLock::new(ProviderState {
+                metadata: Arc::new(metadata),
+                jwks,
+                refresh_after: None,
+            }),
+            metadata_refresh_interval: RwLock::new(None),
+            metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
-            jwks,
             http,
         })
     }
 
-    pub fn metadata(&self) -> &ProviderMetadata {
-        &self.metadata
+    fn provider(&self) -> ProviderState {
+        self.provider
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn metadata_refresh_deadline(&self) -> Option<Instant> {
+        self.metadata_refresh_interval
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(metadata_refresh_deadline)
+    }
+
+    /// Returns the latest successfully fetched provider metadata snapshot.
+    ///
+    /// This accessor performs no I/O. Call
+    /// [`refresh_metadata_if_stale`](Self::refresh_metadata_if_stale) before
+    /// synchronous operations when they must use a current snapshot.
+    pub fn metadata(&self) -> Arc<ProviderMetadata> {
+        self.provider
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .metadata
+            .clone()
     }
 
     pub fn client_id(&self) -> &ClientId {
         &self.client_id
     }
 
-    /// Borrows the JWKS cache used to verify this OP's ID tokens.
+    /// Returns the JWKS cache used to verify this OP's ID tokens.
     ///
     /// The cache is shared across all ID-token / userinfo / token
     /// verifications performed by this `Client`; callers performing
@@ -91,12 +156,99 @@ impl Client {
     /// key fetches, `kid` lookups, and `Cache-Control` honoring are
     /// amortized across the process.
     ///
-    /// Returning `&AsyncHttpsJwks` (not the inner `JsonWebKeySet`)
-    /// keeps the cache hot: passing the borrowed handle to the next
-    /// verify call still hits jose4rs's internal `Arc` and avoids a
-    /// second HTTP fetch when the JWKS is already cached.
-    pub fn jwks(&self) -> &AsyncHttpsJwks {
-        &self.jwks
+    /// `AsyncHttpsJwks` is cheap to clone and shares its cache internally.
+    /// Reacquire this handle after refreshing metadata so a changed
+    /// `jwks_uri` is reflected.
+    pub fn jwks(&self) -> AsyncHttpsJwks {
+        self.provider
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .jwks
+            .clone()
+    }
+
+    /// Sets how long discovered metadata remains fresh.
+    ///
+    /// The next refresh is scheduled relative to this call. A zero interval
+    /// makes every stale check refresh.
+    pub fn set_metadata_refresh_interval(&self, interval: Duration) {
+        *self
+            .metadata_refresh_interval
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(interval);
+        self.provider
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refresh_after = Some(metadata_refresh_deadline(interval));
+    }
+
+    /// Disables automatic stale checks while retaining explicit refreshes.
+    pub fn disable_metadata_refresh(&self) {
+        *self
+            .metadata_refresh_interval
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.provider
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refresh_after = None;
+    }
+
+    /// Refreshes provider metadata when its configured interval has elapsed.
+    ///
+    /// Concurrent stale checks share one refresh. If the `jwks_uri` changes,
+    /// the replacement JWKS cache is populated before the new provider
+    /// snapshot becomes visible. The runtime-independent client does not
+    /// create a background task; call this before synchronous builders when
+    /// freshness is required. Async authorization completion and UserInfo
+    /// operations call it automatically.
+    pub async fn refresh_metadata_if_stale(&self) -> Result<Arc<ProviderMetadata>, OidcError> {
+        let provider = self.provider();
+        if provider.metadata_is_fresh() {
+            return Ok(provider.metadata);
+        }
+
+        let _guard = self.metadata_refresh_lock.lock().await;
+        let provider = self.provider();
+        if provider.metadata_is_fresh() {
+            return Ok(provider.metadata);
+        }
+        self.refresh_metadata_from(provider).await
+    }
+
+    /// Forces an immediate provider metadata refresh.
+    pub async fn refresh_metadata(&self) -> Result<Arc<ProviderMetadata>, OidcError> {
+        let _guard = self.metadata_refresh_lock.lock().await;
+        self.refresh_metadata_from(self.provider()).await
+    }
+
+    /// Fetches a complete replacement before publishing any of it.
+    async fn refresh_metadata_from(
+        &self,
+        current: ProviderState,
+    ) -> Result<Arc<ProviderMetadata>, OidcError> {
+        let metadata =
+            crate::metadata::discover(current.metadata.issuer.clone(), self.http.as_ref()).await?;
+        let jwks = if metadata.jwks_uri == current.metadata.jwks_uri {
+            current.jwks
+        } else {
+            let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(HttpJwksFetcher {
+                http: self.http.clone(),
+            });
+            let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
+            jwks.keys().await?;
+            jwks
+        };
+        let metadata = Arc::new(metadata);
+        *self
+            .provider
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = ProviderState {
+            metadata: metadata.clone(),
+            jwks,
+            refresh_after: self.metadata_refresh_deadline(),
+        };
+        Ok(metadata)
     }
 
     /// Completes the OIDC authorization-code flow.
@@ -146,9 +298,11 @@ impl Client {
         response: AuthorizationResponse,
         pending: PendingAuthRequest,
     ) -> Result<CompleteAuthorization, OidcError> {
+        self.refresh_metadata_if_stale().await?;
         let callback_state = response.state().to_owned();
         validate_pending_request(&pending, &callback_state)?;
-        let expected_issuer = self.metadata.issuer.as_str();
+        let metadata = self.metadata();
+        let expected_issuer = metadata.issuer.as_str();
         match response.issuer() {
             Some(actual) if actual != expected_issuer => {
                 return Err(crate::flow::callback::CallbackError::IssuerMismatch {
@@ -157,7 +311,7 @@ impl Client {
                 }
                 .into());
             }
-            None if self.metadata.authorization_response_iss_parameter_supported => {
+            None if metadata.authorization_response_iss_parameter_supported => {
                 return Err(crate::flow::callback::CallbackError::Missing("iss").into());
             }
             Some(_) | None => {}
@@ -203,16 +357,14 @@ impl Client {
     /// Begins an authorization-code token exchange. `code` is the
     /// short-lived authorization code from the OP callback.
     pub fn exchange_code(&self, code: String) -> Result<CodeTokenRequest, OidcError> {
-        let supported = self
-            .metadata()
-            .token_endpoint_auth_methods_supported
-            .as_deref();
+        let metadata = self.metadata();
+        let supported = metadata.token_endpoint_auth_methods_supported.as_deref();
         let method = crate::flow::token::TokenAuthMethod::from_metadata(
             supported,
             self.client_secret.is_some(),
         )?;
         Ok(CodeTokenRequest::new(
-            self.metadata().token_endpoint.clone(),
+            metadata.token_endpoint.clone(),
             self.client_id().clone(),
             self.client_secret.clone(),
             code,
@@ -242,9 +394,15 @@ impl Client {
         access_token: &AccessToken,
         expected_subject: &str,
     ) -> Result<crate::token::userinfo::UserInfo, OidcError> {
-        let endpoint = self.metadata().userinfo_endpoint.as_ref().ok_or_else(|| {
-            OidcError::InvalidMetadata("provider metadata missing userinfo_endpoint".into())
-        })?;
+        self.refresh_metadata_if_stale().await?;
+        let provider = self.provider();
+        let endpoint = provider
+            .metadata
+            .userinfo_endpoint
+            .as_ref()
+            .ok_or_else(|| {
+                OidcError::InvalidMetadata("provider metadata missing userinfo_endpoint".into())
+            })?;
         let req = HttpRequest {
             method: HttpMethod::Get,
             url: endpoint.as_url().to_string(),
@@ -276,10 +434,10 @@ impl Client {
                 )
             })?;
             let verifier = crate::token::userinfo::UserInfoVerifier::from_metadata(
-                &self.metadata,
+                &provider.metadata,
                 self.client_id.as_str(),
             );
-            crate::token::userinfo::UserInfo::from_signed_jwt(compact, &verifier, &self.jwks)
+            crate::token::userinfo::UserInfo::from_signed_jwt(compact, &verifier, &provider.jwks)
                 .await?
         } else if content_type_essence_is(content_type, "application/json") {
             crate::token::userinfo::UserInfo::from_json(&resp.body)?
@@ -298,16 +456,14 @@ impl Client {
         &self,
         refresh_token: RefreshToken,
     ) -> Result<RefreshTokenRequest, OidcError> {
-        let supported = self
-            .metadata()
-            .token_endpoint_auth_methods_supported
-            .as_deref();
+        let metadata = self.metadata();
+        let supported = metadata.token_endpoint_auth_methods_supported.as_deref();
         let method = crate::flow::token::TokenAuthMethod::from_metadata(
             supported,
             self.client_secret.is_some(),
         )?;
         Ok(RefreshTokenRequest::new(
-            self.metadata().token_endpoint.clone(),
+            metadata.token_endpoint.clone(),
             self.client_id().clone(),
             self.client_secret.clone(),
             refresh_token,
@@ -329,10 +485,8 @@ impl Client {
     /// `IdTokenVerifier::with_allowed_algs` before passing the
     /// verifier to `verify` / `verify_id_token`.
     pub fn verifier(&self) -> crate::token::verify::IdTokenVerifier {
-        crate::token::verify::IdTokenVerifier::from_metadata(
-            self.metadata(),
-            self.client_id().as_str(),
-        )
+        let metadata = self.metadata();
+        crate::token::verify::IdTokenVerifier::from_metadata(&metadata, self.client_id().as_str())
     }
 
     /// Begins building an RP-initiated logout URL (OIDC RP-Initiated
@@ -573,7 +727,20 @@ mod tests {
             let mut responses = self.responses.lock().unwrap();
             let resp = responses.remove(0);
             *self.last_request.lock().unwrap() = Some(req);
-            Box::pin(async move { Ok(resp) })
+            Box::pin(async move {
+                let mut yielded = false;
+                std::future::poll_fn(|context| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        context.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Ok(resp)
+            })
         }
     }
 
@@ -644,28 +811,43 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
-    #[tokio::test]
-    async fn jwks_discovery_populates_cache() {
-        let metadata = serde_json::json!({
+    fn discovery_metadata(token_endpoint: &str, jwks_uri: &str) -> serde_json::Value {
+        serde_json::json!({
             "issuer": "https://idp.example.com",
             "authorization_endpoint": "https://idp.example.com/auth",
-            "token_endpoint": "https://idp.example.com/token",
-            "jwks_uri": "https://idp.example.com/jwks",
+            "token_endpoint": token_endpoint,
+            "jwks_uri": jwks_uri,
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
-        });
+        })
+    }
+
+    fn json_response(value: &serde_json::Value) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: value.to_string().into_bytes(),
+        }
+    }
+
+    fn empty_jwks_response() -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("cache-control".into(), "max-age=3600".into())],
+            body: br#"{"keys":[]}"#.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_discovery_populates_cache() {
+        let metadata = discovery_metadata(
+            "https://idp.example.com/token",
+            "https://idp.example.com/jwks",
+        );
         let http = Arc::new(MockHttp::new(vec![
-            HttpResponse {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: metadata.to_string().into_bytes(),
-            },
-            HttpResponse {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: br#"{"keys":[]}"#.to_vec(),
-            },
+            json_response(&metadata),
+            empty_jwks_response(),
         ]));
 
         let client = Client::discover(
@@ -679,6 +861,161 @@ mod tests {
 
         assert!(client.jwks().keys().await.unwrap().is_empty());
         assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_metadata_refresh_reuses_unchanged_jwks_cache() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+        let original_jwks = client.jwks();
+        client.set_metadata_refresh_interval(Duration::ZERO);
+        http.responses
+            .lock()
+            .unwrap()
+            .push(json_response(&refreshed));
+
+        let metadata = client.refresh_metadata_if_stale().await.unwrap();
+
+        assert_eq!(
+            metadata.token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        assert!(original_jwks.keys().await.unwrap().is_empty());
+        assert!(client.jwks().keys().await.unwrap().is_empty());
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_stale_checks_share_one_metadata_refresh() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response(&refreshed),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+        client.set_metadata_refresh_interval(DEFAULT_METADATA_REFRESH_INTERVAL);
+        client.provider.write().unwrap().refresh_after = Some(Instant::now());
+
+        let (first, second) = tokio::join!(
+            client.refresh_metadata_if_stale(),
+            client.refresh_metadata_if_stale(),
+        );
+
+        assert_eq!(
+            first.unwrap().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        assert_eq!(
+            second.unwrap().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_refresh_replaces_changed_jwks_cache() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token",
+            "https://idp.example.com/jwks-v1",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token",
+            "https://idp.example.com/jwks-v2",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response(&refreshed),
+            empty_jwks_response(),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+        client.set_metadata_refresh_interval(Duration::ZERO);
+
+        client.refresh_metadata_if_stale().await.unwrap();
+
+        assert_eq!(
+            client.metadata().jwks_uri.as_url().as_str(),
+            "https://idp.example.com/jwks-v2"
+        );
+        assert_eq!(
+            http.last_request.lock().unwrap().as_ref().unwrap().url,
+            "https://idp.example.com/jwks-v2"
+        );
+        assert!(client.jwks().keys().await.unwrap().is_empty());
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_refresh_retains_previous_snapshot() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            HttpResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+        client.set_metadata_refresh_interval(Duration::ZERO);
+
+        assert!(client.refresh_metadata_if_stale().await.is_err());
+        assert_eq!(
+            client.metadata().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v1"
+        );
+        assert!(client.jwks().keys().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1484,27 +1821,22 @@ mod tests {
         assert!(matches!(err, OidcError::UserInfoSubjectMismatch));
     }
 
-    #[test]
-    fn jwks_accessor_returns_shared_cache() {
-        // The same `AsyncHttpsJwks` should be returned across
-        // repeated calls so resource-server code can cache it in a
-        // per-request closure without losing the kid / Cache-Control
-        // state that jose4rs keeps internally.
-        let http = Arc::new(MockHttp::new(vec![]));
+    #[tokio::test]
+    async fn jwks_accessor_returns_shared_cache() {
+        let http = Arc::new(MockHttp::new(vec![empty_jwks_response()]));
         let client = Client::from_parts(
             provider_metadata(),
             ClientId::new("c").unwrap(),
             None,
-            http as Arc<dyn AsyncHttpClient>,
+            http.clone() as Arc<dyn AsyncHttpClient>,
         )
         .unwrap();
-        let a: *const AsyncHttpsJwks = client.jwks();
-        let b: *const AsyncHttpsJwks = client.jwks();
-        assert!(std::ptr::eq(a, b));
-        // The metadata URL the cache was constructed with must match
-        // the well-known jwks_uri so a caller pulling the JWKS via
-        // `client.jwks().select_verification_key(...)` looks keys up
-        // against the right OP.
+        let first = client.jwks();
+        let second = client.jwks();
+
+        assert!(first.keys().await.unwrap().is_empty());
+        assert!(second.keys().await.unwrap().is_empty());
+        assert!(http.responses.lock().unwrap().is_empty());
         assert_eq!(
             client.metadata().jwks_uri.as_url().as_str(),
             "https://idp.example.com/jwks"

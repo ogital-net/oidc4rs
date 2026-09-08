@@ -891,6 +891,7 @@ dependencies = [
  "boring-sys",
  "bytes",
  "futures",
+ "futures-util",
  "hmac",
  "http-body-util",
  "hyper",
