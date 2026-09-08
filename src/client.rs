@@ -26,8 +26,8 @@ pub struct Client {
 
 impl Client {
     /// Performs discovery from `issuer` and returns a fully wired
-    /// `Client`. Wires the JWKS cache through a `reqwest`-style
-    /// `AsyncJwksFetcher` backed by the supplied HTTP client.
+    /// `Client`. Fetches the initial JWKS through the same cache used
+    /// for future refreshes.
     pub async fn discover<C>(
         issuer: crate::types::IssuerUrl,
         client_id: ClientId,
@@ -37,9 +37,10 @@ impl Client {
     where
         C: AsyncHttpClient + 'static,
     {
-        let (metadata, _keys) = crate::metadata::discover(issuer, http.as_ref()).await?;
+        let metadata = crate::metadata::discover(issuer, http.as_ref()).await?;
         let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(HttpJwksFetcher { http: http.clone() });
         let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
+        jwks.keys().await?;
 
         Ok(Self {
             metadata,
@@ -527,18 +528,21 @@ impl AsyncJwksFetcher for HttpJwksFetcher {
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("expires"))
                 .map(|(_, v)| v.clone());
+            let age = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("age"))
+                .and_then(|(_, v)| v.parse().ok())
+                .map(std::time::Duration::from_secs);
             Ok(FetchResponse {
                 body: resp.body,
                 cache_control,
                 expires,
+                age,
             })
         })
     }
 }
-
-// AsyncHttpsJwks does not currently expose a public seed method. The
-// discover path intentionally re-fetches the JWKS on first validation.
-// Pre-seeding from the discovery response is tracked under SPEC §8.5.
 
 #[cfg(test)]
 mod tests {
@@ -638,6 +642,57 @@ mod tests {
             "userinfo_signing_alg_values_supported": ["RS256"],
         });
         serde_json::from_value(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn jwks_discovery_populates_cache() {
+        let metadata = serde_json::json!({
+            "issuer": "https://idp.example.com",
+            "authorization_endpoint": "https://idp.example.com/auth",
+            "token_endpoint": "https://idp.example.com/token",
+            "jwks_uri": "https://idp.example.com/jwks",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        });
+        let http = Arc::new(MockHttp::new(vec![
+            HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: metadata.to_string().into_bytes(),
+            },
+            HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"keys":[]}"#.to_vec(),
+            },
+        ]));
+
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(client.jwks().keys().await.unwrap().is_empty());
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn jwks_fetcher_forwards_age_header() {
+        let http = Arc::new(MockHttp::new(vec![HttpResponse {
+            status: 200,
+            headers: vec![("AGE".into(), "120".into())],
+            body: br#"{"keys":[]}"#.to_vec(),
+        }]));
+        let fetcher = HttpJwksFetcher { http };
+
+        let response = fetcher.fetch("https://idp.example.com/jwks").await.unwrap();
+
+        assert_eq!(response.age, Some(std::time::Duration::from_secs(120)));
     }
 
     #[tokio::test]

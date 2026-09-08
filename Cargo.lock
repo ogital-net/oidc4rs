@@ -520,6 +520,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -706,13 +712,15 @@ dependencies = [
 
 [[package]]
 name = "jose4rs"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26256a0e90c52c65777bf9cede2f4044fa01d7e93ba494802c5b2c7702daa038"
+checksum = "22ec199ded91e630db7fefa04e31227a5fb50a17df66cfbf5b3422df664f21ff"
 dependencies = [
  "aws-lc-sys",
  "base64-simd",
  "boring-sys",
+ "futures-util",
+ "httpdate",
  "memchr",
  "simd-json",
 ]

@@ -218,7 +218,7 @@ children once their parent is done.
 
 ### 8.1 Crate skeleton
 
-- [x] Cargo.toml with `jose4rs` git-rev dep + optional `aws-lc-sys`/`boring-sys`
+- [x] Cargo.toml with `jose4rs` crates.io dep + optional `aws-lc-sys`/`boring-sys`
 - [x] `src/lib.rs` re-exports
 - [x] `src/error.rs` with `OidcError`
 - [x] Build cleanly with `cargo build` and `cargo build --no-default-features --features boring`
@@ -250,8 +250,9 @@ children once their parent is done.
 ### 8.5 Metadata and discovery
 
 - [x] `metadata::ProviderMetadata` with all OIDC Discovery fields as `Option<...>`
-- [x] `metadata::discover()` returns `(ProviderMetadata, JsonWebKeySet)`
+- [x] `metadata::discover()` returns validated `ProviderMetadata`
 - [x] Issuer equality check against input
+- [x] `Client::discover()` eagerly populates its `AsyncHttpsJwks` cache
 
 ### 8.6 Claims
 

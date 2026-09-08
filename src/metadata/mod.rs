@@ -4,18 +4,12 @@ pub mod provider;
 
 pub use provider::ProviderMetadata;
 
-use jose4rs::jwk::JsonWebKeySet;
-
 use crate::error::OidcError;
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::types::IssuerUrl;
 
-/// Performs OIDC discovery: fetches `/.well-known/openid-configuration`
-/// and the OP JWKS, validates the issuer, and returns both.
-pub async fn discover<C>(
-    issuer: IssuerUrl,
-    http: &C,
-) -> Result<(ProviderMetadata, JsonWebKeySet), OidcError>
+/// Fetches and validates the OP's discovery metadata.
+pub async fn discover<C>(issuer: IssuerUrl, http: &C) -> Result<ProviderMetadata, OidcError>
 where
     C: AsyncHttpClient + ?Sized,
 {
@@ -59,23 +53,5 @@ where
         )));
     }
 
-    let jwks_req = HttpRequest {
-        method: HttpMethod::Get,
-        url: metadata.jwks_uri.as_str().to_owned(),
-        headers: vec![("Accept".into(), "application/json".into())],
-        body: None,
-    };
-    let jwks_resp = http
-        .execute(jwks_req)
-        .await
-        .map_err(|e| OidcError::Discovery(format!("jwks: {e}")))?;
-    if jwks_resp.status != 200 {
-        return Err(OidcError::Discovery(format!(
-            "jwks HTTP {} from {}",
-            jwks_resp.status, metadata.jwks_uri
-        )));
-    }
-    let keys = JsonWebKeySet::from_json(&jwks_resp.body)?;
-
-    Ok((metadata, keys))
+    Ok(metadata)
 }
