@@ -253,7 +253,7 @@ children once their parent is done.
 - [x] `metadata::discover()` returns validated `ProviderMetadata`
 - [x] Issuer equality check against input
 - [x] `Client::discover()` eagerly populates its `AsyncHttpsJwks` cache
-- [x] `Client` caches provider metadata and refreshes stale snapshots with async single-flight
+- [x] `Client` caches provider metadata using `Cache-Control`, `Expires`, and `Age`; a configurable 60-second minimum prevents per-login refreshes, and stale refreshes use async single-flight with bounded stale-on-error fallback
 
 ### 8.6 Claims
 
@@ -377,7 +377,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 | Issuer equality check | Already | `metadata::discover` |
 | JWKS fetch | Already | `AsyncHttpsJwks`; `Client::jwks()` accessor lets resource-server code reuse the same cache for bearer-JWT verification via `jose4rs` directly |
 | Forward-compatible unknown-field capture | Already | `extra: serde_json::Map` flatten |
-| Metadata refresh | Already | `Client::refresh_metadata_if_stale`; one-hour default, configurable, no runtime-specific background task |
+| Metadata refresh | Already | `Client::refresh_metadata_if_stale`; honors HTTP freshness with a configurable one-hour fallback, configurable 60-second minimum reuse, bounded stale-on-error retention, and no runtime-specific background task |
 | `AdditionalProviderMetadata` trait | Add | openidconnect-rs has; we keep the flat map |
 | JWKS TTL / refresh hint caching | Already | `AsyncHttpsJwks` honors `cache-control` |
 | `IssuerUrl::join(".well-known/openid-configuration")` | Already | `metadata::discover` does it |

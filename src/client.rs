@@ -10,20 +10,28 @@ use crate::error::OidcError;
 use crate::flow::authorize::PendingAuthRequest;
 use crate::flow::callback::{AuthorizationResponse, CallbackError, parse_authorization_response};
 use crate::flow::token::{BuiltTokenRequest, CodeTokenRequest, RefreshTokenRequest};
-use crate::metadata::ProviderMetadata;
+use crate::metadata::{CachePolicy, ProviderMetadata};
 use crate::token::response::{IdToken, TokenResponse};
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::transport::kv::AsyncKvStore;
 use crate::types::{AccessToken, ClientId, ClientSecret, RefreshToken};
 
-/// Default interval between successful provider metadata fetches.
+/// Default metadata freshness when discovery supplies no cache lifetime.
 pub const DEFAULT_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Default minimum time a successful discovery response is reused.
+pub const DEFAULT_METADATA_MINIMUM_CACHE_DURATION: Duration = Duration::from_secs(60);
+
+/// Default time stale metadata remains usable after an automatic refresh failure.
+pub const DEFAULT_METADATA_RETAIN_ON_ERROR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Suppresses repeated automatic refresh attempts during a provider outage.
+const METADATA_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// OIDC relying-party client.
 #[allow(clippy::struct_field_names)] // `Client.client_id` / `Client.client_secret` are the standard names.
 pub struct Client {
     provider: RwLock<ProviderState>,
-    metadata_refresh_interval: RwLock<Option<Duration>>,
     metadata_refresh_lock: AsyncMutex<()>,
     pub(crate) client_id: ClientId,
     pub(crate) client_secret: Option<ClientSecret>,
@@ -36,12 +44,19 @@ struct ProviderState {
     metadata: Arc<ProviderMetadata>,
     jwks: AsyncHttpsJwks,
     refresh_after: Option<Instant>,
+    stale_until: Option<Instant>,
+    retry_after: Option<Instant>,
+    /// Whether the response policy permits use after freshness expires.
+    stale_on_error: bool,
+    metadata_refresh_interval: Option<Duration>,
+    metadata_minimum_cache_duration: Duration,
 }
 
 impl ProviderState {
-    fn metadata_is_fresh(&self) -> bool {
-        self.refresh_after
-            .is_none_or(|deadline| Instant::now() < deadline)
+    fn metadata_needs_refresh(&self) -> bool {
+        let now = Instant::now();
+        self.refresh_after.is_some_and(|deadline| now >= deadline)
+            && self.retry_after.is_none_or(|deadline| now >= deadline)
     }
 }
 
@@ -51,12 +66,33 @@ fn metadata_refresh_deadline(interval: Duration) -> Instant {
     now.checked_add(interval).unwrap_or(now)
 }
 
+/// Converts response freshness policy into monotonic cache deadlines.
+fn metadata_cache_deadlines(policy: CachePolicy) -> (Option<Instant>, Option<Instant>, bool) {
+    match policy {
+        CachePolicy::CacheFor {
+            lifetime,
+            must_revalidate,
+        } => {
+            let refresh_after = metadata_refresh_deadline(lifetime);
+            let stale_until = (!must_revalidate).then(|| {
+                refresh_after
+                    .checked_add(DEFAULT_METADATA_RETAIN_ON_ERROR)
+                    .unwrap_or(refresh_after)
+            });
+            (Some(refresh_after), stale_until, !must_revalidate)
+        }
+        CachePolicy::Revalidate | CachePolicy::DoNotStore => (Some(Instant::now()), None, false),
+    }
+}
+
 impl Client {
     /// Performs discovery from `issuer` and returns a fully wired
     /// `Client`. Fetches the initial JWKS through the same cache used
-    /// for future refreshes. Provider metadata remains fresh for
-    /// [`DEFAULT_METADATA_REFRESH_INTERVAL`] and is then refreshed by
-    /// async client operations or an explicit stale check.
+    /// for future refreshes. Provider metadata freshness follows its HTTP
+    /// response, with [`DEFAULT_METADATA_REFRESH_INTERVAL`] as the fallback.
+    /// Successful responses are reused for at least
+    /// [`DEFAULT_METADATA_MINIMUM_CACHE_DURATION`]. Stale metadata is refreshed
+    /// by async client operations or an explicit stale check.
     pub async fn discover<C>(
         issuer: crate::types::IssuerUrl,
         client_id: ClientId,
@@ -66,7 +102,13 @@ impl Client {
     where
         C: AsyncHttpClient + 'static,
     {
-        let metadata = crate::metadata::discover(issuer, http.as_ref()).await?;
+        let discovered = crate::metadata::discover_with_cache(issuer, http.as_ref()).await?;
+        let (refresh_after, stale_until, stale_on_error) =
+            metadata_cache_deadlines(discovered.cache_policy(
+                DEFAULT_METADATA_REFRESH_INTERVAL,
+                DEFAULT_METADATA_MINIMUM_CACHE_DURATION,
+            ));
+        let metadata = discovered.metadata;
         let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(HttpJwksFetcher { http: http.clone() });
         let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
         jwks.keys().await?;
@@ -75,9 +117,13 @@ impl Client {
             provider: RwLock::new(ProviderState {
                 metadata: Arc::new(metadata),
                 jwks,
-                refresh_after: Some(metadata_refresh_deadline(DEFAULT_METADATA_REFRESH_INTERVAL)),
+                refresh_after,
+                stale_until,
+                retry_after: None,
+                stale_on_error,
+                metadata_refresh_interval: Some(DEFAULT_METADATA_REFRESH_INTERVAL),
+                metadata_minimum_cache_duration: DEFAULT_METADATA_MINIMUM_CACHE_DURATION,
             }),
-            metadata_refresh_interval: RwLock::new(Some(DEFAULT_METADATA_REFRESH_INTERVAL)),
             metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
@@ -106,8 +152,12 @@ impl Client {
                 metadata: Arc::new(metadata),
                 jwks,
                 refresh_after: None,
+                stale_until: None,
+                retry_after: None,
+                stale_on_error: true,
+                metadata_refresh_interval: None,
+                metadata_minimum_cache_duration: DEFAULT_METADATA_MINIMUM_CACHE_DURATION,
             }),
-            metadata_refresh_interval: RwLock::new(None),
             metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
@@ -120,13 +170,6 @@ impl Client {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    fn metadata_refresh_deadline(&self) -> Option<Instant> {
-        self.metadata_refresh_interval
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .map(metadata_refresh_deadline)
     }
 
     /// Returns the latest successfully fetched provider metadata snapshot.
@@ -167,59 +210,124 @@ impl Client {
             .clone()
     }
 
-    /// Sets how long discovered metadata remains fresh.
+    /// Sets fallback freshness for discovery responses without a cache lifetime.
     ///
-    /// The next refresh is scheduled relative to this call. A zero interval
-    /// makes every stale check refresh.
+    /// The current snapshot is rescheduled relative to this call. Subsequent
+    /// responses with `Cache-Control: max-age` or `Expires` override this
+    /// fallback. The effective interval is also bounded by the configured
+    /// metadata minimum cache duration.
     pub fn set_metadata_refresh_interval(&self, interval: Duration) {
-        *self
-            .metadata_refresh_interval
+        let mut provider = self
+            .provider
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = Some(interval);
-        self.provider
+            .unwrap_or_else(PoisonError::into_inner);
+        provider.metadata_refresh_interval = Some(interval);
+        let refresh_after =
+            metadata_refresh_deadline(interval.max(provider.metadata_minimum_cache_duration));
+        provider.refresh_after = Some(refresh_after);
+        provider.stale_until = provider.stale_on_error.then(|| {
+            refresh_after
+                .checked_add(DEFAULT_METADATA_RETAIN_ON_ERROR)
+                .unwrap_or(refresh_after)
+        });
+        provider.retry_after = None;
+    }
+
+    /// Sets the minimum time a successful discovery response is reused.
+    ///
+    /// This availability safeguard applies even when the response requests
+    /// immediate revalidation or no storage. Forced refreshes still bypass it.
+    /// Set it to zero so subsequent responses honor their freshness strictly.
+    /// Increasing the minimum extends the current snapshot; reducing it applies
+    /// after the next successful metadata fetch.
+    pub fn set_metadata_minimum_cache_duration(&self, duration: Duration) {
+        let mut provider = self
+            .provider
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .refresh_after = Some(metadata_refresh_deadline(interval));
+            .unwrap_or_else(PoisonError::into_inner);
+        provider.metadata_minimum_cache_duration = duration;
+        provider.retry_after = None;
+        if provider.metadata_refresh_interval.is_none() {
+            return;
+        }
+
+        let minimum_refresh_after = metadata_refresh_deadline(duration);
+        if provider
+            .refresh_after
+            .is_none_or(|refresh_after| refresh_after < minimum_refresh_after)
+        {
+            provider.refresh_after = Some(minimum_refresh_after);
+            provider.stale_until = provider.stale_on_error.then(|| {
+                minimum_refresh_after
+                    .checked_add(DEFAULT_METADATA_RETAIN_ON_ERROR)
+                    .unwrap_or(minimum_refresh_after)
+            });
+        }
     }
 
     /// Disables automatic stale checks while retaining explicit refreshes.
     pub fn disable_metadata_refresh(&self) {
-        *self
-            .metadata_refresh_interval
+        let mut provider = self
+            .provider
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        self.provider
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .refresh_after = None;
+            .unwrap_or_else(PoisonError::into_inner);
+        provider.metadata_refresh_interval = None;
+        provider.refresh_after = None;
+        provider.stale_until = None;
+        provider.retry_after = None;
     }
 
     /// Refreshes provider metadata when its configured interval has elapsed.
     ///
-    /// Concurrent stale checks share one refresh. If the `jwks_uri` changes,
-    /// the replacement JWKS cache is populated before the new provider
-    /// snapshot becomes visible. The runtime-independent client does not
-    /// create a background task; call this before synchronous builders when
-    /// freshness is required. Async authorization completion and UserInfo
-    /// operations call it automatically.
+    /// Concurrent stale checks share one refresh. On failure, the last
+    /// successful snapshot remains usable for a bounded period unless the
+    /// response required revalidation. If the `jwks_uri` changes, the
+    /// replacement JWKS cache is populated before the new provider snapshot
+    /// becomes visible. The runtime-independent client does not create a
+    /// background task; call this before synchronous builders when freshness
+    /// is required. Async authorization completion and UserInfo operations
+    /// call it automatically.
     pub async fn refresh_metadata_if_stale(&self) -> Result<Arc<ProviderMetadata>, OidcError> {
         let provider = self.provider();
-        if provider.metadata_is_fresh() {
+        if !provider.metadata_needs_refresh() {
             return Ok(provider.metadata);
         }
 
         let _guard = self.metadata_refresh_lock.lock().await;
         let provider = self.provider();
-        if provider.metadata_is_fresh() {
+        if !provider.metadata_needs_refresh() {
             return Ok(provider.metadata);
         }
-        self.refresh_metadata_from(provider).await
+        match self.refresh_metadata_from(provider).await {
+            Ok(metadata) => Ok(metadata),
+            Err(error) => self.metadata_after_refresh_error(error),
+        }
     }
 
-    /// Forces an immediate provider metadata refresh.
+    /// Forces an immediate provider metadata refresh and reports any failure.
     pub async fn refresh_metadata(&self) -> Result<Arc<ProviderMetadata>, OidcError> {
         let _guard = self.metadata_refresh_lock.lock().await;
         self.refresh_metadata_from(self.provider()).await
+    }
+
+    /// Retains an eligible stale snapshot and defers the next automatic retry.
+    fn metadata_after_refresh_error(
+        &self,
+        error: OidcError,
+    ) -> Result<Arc<ProviderMetadata>, OidcError> {
+        let now = Instant::now();
+        let mut provider = self
+            .provider
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(stale_until) = provider.stale_until.filter(|deadline| now < *deadline) else {
+            return Err(error);
+        };
+        let retry_after = now
+            .checked_add(METADATA_REFRESH_RETRY_INTERVAL)
+            .map_or(stale_until, |deadline| deadline.min(stale_until));
+        provider.retry_after = Some(retry_after);
+        Ok(provider.metadata.clone())
     }
 
     /// Fetches a complete replacement before publishing any of it.
@@ -227,26 +335,48 @@ impl Client {
         &self,
         current: ProviderState,
     ) -> Result<Arc<ProviderMetadata>, OidcError> {
-        let metadata =
-            crate::metadata::discover(current.metadata.issuer.clone(), self.http.as_ref()).await?;
-        let jwks = if metadata.jwks_uri == current.metadata.jwks_uri {
+        let discovered = crate::metadata::discover_with_cache(
+            current.metadata.issuer.clone(),
+            self.http.as_ref(),
+        )
+        .await?;
+        let jwks = if discovered.metadata.jwks_uri == current.metadata.jwks_uri {
             current.jwks
         } else {
             let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(HttpJwksFetcher {
                 http: self.http.clone(),
             });
-            let jwks = AsyncHttpsJwks::new(metadata.jwks_uri.as_url().as_str(), fetcher);
+            let jwks = AsyncHttpsJwks::new(discovered.metadata.jwks_uri.as_url().as_str(), fetcher);
             jwks.keys().await?;
             jwks
         };
-        let metadata = Arc::new(metadata);
-        *self
+        let mut provider = self
             .provider
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = ProviderState {
+            .unwrap_or_else(PoisonError::into_inner);
+        let metadata_refresh_interval = provider.metadata_refresh_interval;
+        let metadata_minimum_cache_duration = provider.metadata_minimum_cache_duration;
+        let cache_policy = discovered.cache_policy(
+            metadata_refresh_interval.unwrap_or(DEFAULT_METADATA_REFRESH_INTERVAL),
+            metadata_minimum_cache_duration,
+        );
+        let (policy_refresh_after, policy_stale_until, stale_on_error) =
+            metadata_cache_deadlines(cache_policy);
+        let (refresh_after, stale_until) = if metadata_refresh_interval.is_some() {
+            (policy_refresh_after, policy_stale_until)
+        } else {
+            (None, None)
+        };
+        let metadata = Arc::new(discovered.metadata);
+        *provider = ProviderState {
             metadata: metadata.clone(),
             jwks,
-            refresh_after: self.metadata_refresh_deadline(),
+            refresh_after,
+            stale_until,
+            retry_after: None,
+            stale_on_error,
+            metadata_refresh_interval,
+            metadata_minimum_cache_duration,
         };
         Ok(metadata)
     }
@@ -831,12 +961,26 @@ mod tests {
         }
     }
 
+    fn json_response_with_headers(
+        value: &serde_json::Value,
+        headers: Vec<(String, String)>,
+    ) -> HttpResponse {
+        let mut response = json_response(value);
+        response.headers.extend(headers);
+        response
+    }
+
     fn empty_jwks_response() -> HttpResponse {
         HttpResponse {
             status: 200,
             headers: vec![("cache-control".into(), "max-age=3600".into())],
             body: br#"{"keys":[]}"#.to_vec(),
         }
+    }
+
+    fn expire_metadata(client: &Client) {
+        client.set_metadata_minimum_cache_duration(Duration::ZERO);
+        client.set_metadata_refresh_interval(Duration::ZERO);
     }
 
     #[tokio::test]
@@ -864,6 +1008,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_metadata_minimum_cache_duration_bounds_refresh_interval() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response_with_headers(
+                &initial,
+                vec![("cache-control".into(), "no-cache, no-store".into())],
+            ),
+            empty_jwks_response(),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+        client.set_metadata_refresh_interval(Duration::ZERO);
+
+        let metadata = client.refresh_metadata_if_stale().await.unwrap();
+
+        assert_eq!(
+            metadata.token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v1"
+        );
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_metadata_minimum_cache_duration_honors_no_cache() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response_with_headers(
+                &refreshed,
+                vec![("cache-control".into(), "no-cache".into())],
+            ),
+            HttpResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+        client.set_metadata_minimum_cache_duration(Duration::ZERO);
+
+        client.refresh_metadata().await.unwrap();
+
+        assert!(client.refresh_metadata_if_stale().await.is_err());
+        assert_eq!(
+            client.metadata().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_metadata_refresh_reuses_unchanged_jwks_cache() {
         let initial = discovery_metadata(
             "https://idp.example.com/token-v1",
@@ -886,7 +1104,7 @@ mod tests {
         .await
         .unwrap();
         let original_jwks = client.jwks();
-        client.set_metadata_refresh_interval(Duration::ZERO);
+        expire_metadata(&client);
         http.responses
             .lock()
             .unwrap()
@@ -969,7 +1187,7 @@ mod tests {
         )
         .await
         .unwrap();
-        client.set_metadata_refresh_interval(Duration::ZERO);
+        expire_metadata(&client);
 
         client.refresh_metadata_if_stale().await.unwrap();
 
@@ -986,7 +1204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_metadata_refresh_retains_previous_snapshot() {
+    async fn failed_automatic_metadata_refresh_retains_previous_snapshot() {
         let initial = discovery_metadata(
             "https://idp.example.com/token-v1",
             "https://idp.example.com/jwks",
@@ -1008,14 +1226,257 @@ mod tests {
         )
         .await
         .unwrap();
-        client.set_metadata_refresh_interval(Duration::ZERO);
+        expire_metadata(&client);
+
+        let metadata = client.refresh_metadata_if_stale().await.unwrap();
+        assert_eq!(
+            metadata.token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v1"
+        );
+        assert_eq!(
+            client.metadata().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v1"
+        );
+        assert!(client.jwks().keys().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn must_revalidate_disables_stale_metadata_fallback() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response_with_headers(
+                &initial,
+                vec![("cache-control".into(), "max-age=0, must-revalidate".into())],
+            ),
+            empty_jwks_response(),
+            HttpResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+        expire_metadata(&client);
 
         assert!(client.refresh_metadata_if_stale().await.is_err());
         assert_eq!(
             client.metadata().token_endpoint.as_url().as_str(),
             "https://idp.example.com/token-v1"
         );
-        assert!(client.jwks().keys().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_metadata_retry_is_deferred_and_bounded() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let unavailable = || HttpResponse {
+            status: 503,
+            headers: vec![],
+            body: vec![],
+        };
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            unavailable(),
+            unavailable(),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http.clone(),
+        )
+        .await
+        .unwrap();
+        expire_metadata(&client);
+        let original_stale_until = client.provider.read().unwrap().stale_until;
+
+        client.refresh_metadata_if_stale().await.unwrap();
+        client.refresh_metadata_if_stale().await.unwrap();
+
+        assert_eq!(
+            client.provider.read().unwrap().stale_until,
+            original_stale_until
+        );
+        assert_eq!(http.responses.lock().unwrap().len(), 1);
+
+        {
+            let mut provider = client.provider.write().unwrap();
+            provider.stale_until = Some(Instant::now());
+            provider.retry_after = None;
+        }
+        assert!(client.refresh_metadata_if_stale().await.is_err());
+        assert!(http.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_metadata_refresh_reports_failure() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            HttpResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+
+        assert!(client.refresh_metadata().await.is_err());
+        assert_eq!(
+            client.metadata().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_metadata_refresh_wins_during_in_flight_refresh() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response_with_headers(
+                &refreshed,
+                vec![("cache-control".into(), "max-age=0".into())],
+            ),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+
+        let (refresh, ()) = tokio::join!(
+            biased;
+            client.refresh_metadata(),
+            async { client.disable_metadata_refresh() },
+        );
+
+        assert_eq!(
+            refresh.unwrap().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        let provider = client.provider.read().unwrap();
+        assert!(provider.metadata_refresh_interval.is_none());
+        assert!(provider.refresh_after.is_none());
+        assert!(!provider.metadata_needs_refresh());
+    }
+
+    #[tokio::test]
+    async fn setting_metadata_refresh_interval_wins_during_in_flight_refresh() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response(&refreshed),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+        client.disable_metadata_refresh();
+        client.set_metadata_minimum_cache_duration(Duration::ZERO);
+
+        let (refresh, ()) = tokio::join!(
+            biased;
+            client.refresh_metadata(),
+            async { client.set_metadata_refresh_interval(Duration::ZERO) },
+        );
+
+        assert_eq!(
+            refresh.unwrap().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        let provider = client.provider.read().unwrap();
+        assert_eq!(provider.metadata_refresh_interval, Some(Duration::ZERO));
+        assert!(provider.metadata_needs_refresh());
+    }
+
+    #[tokio::test]
+    async fn setting_metadata_minimum_cache_duration_wins_during_in_flight_refresh() {
+        let initial = discovery_metadata(
+            "https://idp.example.com/token-v1",
+            "https://idp.example.com/jwks",
+        );
+        let refreshed = discovery_metadata(
+            "https://idp.example.com/token-v2",
+            "https://idp.example.com/jwks",
+        );
+        let http = Arc::new(MockHttp::new(vec![
+            json_response(&initial),
+            empty_jwks_response(),
+            json_response_with_headers(
+                &refreshed,
+                vec![("cache-control".into(), "no-cache".into())],
+            ),
+        ]));
+        let client = Client::discover(
+            "https://idp.example.com".parse().unwrap(),
+            ClientId::new("c").unwrap(),
+            None,
+            http,
+        )
+        .await
+        .unwrap();
+        let minimum = Duration::from_secs(3600);
+
+        let (refresh, ()) = tokio::join!(
+            biased;
+            client.refresh_metadata(),
+            async { client.set_metadata_minimum_cache_duration(minimum) },
+        );
+
+        assert_eq!(
+            refresh.unwrap().token_endpoint.as_url().as_str(),
+            "https://idp.example.com/token-v2"
+        );
+        let provider = client.provider.read().unwrap();
+        assert_eq!(provider.metadata_minimum_cache_duration, minimum);
+        assert!(!provider.metadata_needs_refresh());
     }
 
     #[tokio::test]
