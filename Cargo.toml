@@ -25,7 +25,7 @@ include = [
 # Backend selection (`aws-lc` or `boring`) is gated by oidc4rs's own
 # `[features]` block below so we cannot accidentally enable both at
 # the same time.
-jose4rs = { version = "0.5", default-features = false }
+jose4rs = { version = "0", default-features = false }
 
 # FFI bindings to the same backend jose4rs selected. Optional so the
 # compile-time guard below can enforce exactly-one selection.
