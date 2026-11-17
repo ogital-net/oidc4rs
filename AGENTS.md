@@ -25,8 +25,9 @@ rationale.
 ## Style
 
 - `cargo fmt` is the only formatter. Do not configure a different style.
-- Every commit must pass `cargo fmt --check` and
-  `cargo clippy --all-targets --all-features -- -D warnings`.
+- Every commit must pass `cargo fmt --check` and both Clippy checks:
+  `cargo clippy --all-targets --features hyper -- -D warnings` and
+  `cargo clippy --all-targets --no-default-features --features boring -- -D warnings`.
 - Prefer `?` over `.unwrap()` / `.expect()`. The only allowed
   `.expect()`s are on paths that can never fail because of a static
   invariant (e.g. parsing a literal the program itself wrote).

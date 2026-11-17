@@ -902,7 +902,7 @@ mod tests {
         // silently passing.
         let meta = metadata_with_algs(vec![]);
         let v = IdTokenVerifier::from_metadata(&meta, "my-client");
-        assert!(v.allowed_algs().is_empty());
+        assert_eq!(v.allowed_algs(), &[] as &[String]);
     }
 
     #[test]
