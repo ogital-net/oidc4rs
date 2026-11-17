@@ -4,6 +4,7 @@
 //! - signature via `JsonWebSignature::verify_signature(&key)`
 //! - `alg` against the verifier's allow-list
 //! - `iss`, `aud`, `exp`, `iat`, `nbf` via `JwtConsumer`
+//! - additional `aud` values must be explicitly trusted
 //! - `azp` rule: when `aud` has multiple values, `azp` must equal the
 //!   configured client id
 //! - `nonce` matches the second-leg state (caller supplies it)
@@ -63,6 +64,7 @@ pub(crate) fn is_forbidden_alg(alg: &str) -> bool {
 pub struct IdTokenVerifier {
     expected_issuer: String,
     expected_audience: String,
+    trusted_additional_audiences: Vec<String>,
     allowed_algs: Vec<String>,
 }
 
@@ -76,6 +78,7 @@ impl IdTokenVerifier {
         Self {
             expected_issuer: expected_issuer.into(),
             expected_audience: expected_audience.into(),
+            trusted_additional_audiences: Vec::new(),
             allowed_algs: DEFAULT_ALLOWED_ALGS
                 .iter()
                 .map(|s| (*s).to_owned())
@@ -97,6 +100,7 @@ impl IdTokenVerifier {
         Self {
             expected_issuer: metadata.issuer.as_str().to_owned(),
             expected_audience: audience.into(),
+            trusted_additional_audiences: Vec::new(),
             allowed_algs: metadata
                 .id_token_signing_alg_values_supported
                 .iter()
@@ -122,6 +126,17 @@ impl IdTokenVerifier {
 
     pub fn audience(&self) -> &str {
         &self.expected_audience
+    }
+
+    /// Replaces the trusted list of additional ID-token audiences.
+    /// By default, only the configured client ID is trusted. It must
+    /// still appear in `aud` even when additional audiences are trusted.
+    pub fn with_trusted_additional_audiences(
+        mut self,
+        audiences: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.trusted_additional_audiences = audiences.into_iter().collect();
+        self
     }
 
     /// Returns the configured allow-list as a borrowed slice of
@@ -152,8 +167,13 @@ impl IdTokenVerifier {
         // 3+4. Signature + claim-level validation.
         let claims = verify_signature_and_claims(self, &jws, &key, ctx)?;
 
-        // 5. azp.
-        check_azp(&claims, ctx, &self.expected_audience)?;
+        // 5. Additional audiences and azp.
+        check_azp(
+            &claims,
+            ctx,
+            &self.expected_audience,
+            &self.trusted_additional_audiences,
+        )?;
 
         // 6. nonce.
         check_nonce(&claims, ctx)?;
@@ -231,17 +251,28 @@ fn verify_signature_and_claims(
         .map_err(Into::into)
 }
 
-/// Enforces the azp rules from OIDC Core 1.0 section 3.1.3.7: azp is
+/// Enforces audience trust and the azp rules from OIDC Core 1.0 section 3.1.3.7: azp is
 /// required when `aud` is multi-valued, and whenever azp is present it
 /// must equal the relying party's client id.
 fn check_azp(
     claims: &JwtClaims,
     ctx: &VerifyContext,
     expected_audience: &str,
+    trusted_additional_audiences: &[String],
 ) -> Result<(), OidcError> {
+    let audiences = claims.audience().unwrap_or_default();
+    if audiences.iter().any(|audience| {
+        *audience != expected_audience
+            && !trusted_additional_audiences
+                .iter()
+                .any(|trusted| trusted == audience)
+    }) {
+        return Err(OidcError::InvalidIdToken(
+            jose4rs::jwt::InvalidJwtError::new("aud contains an untrusted additional audience"),
+        ));
+    }
     let azp = claims.string_claim("azp");
-    let multi_aud = claims.audience().is_some_and(|aud| aud.len() > 1);
-    if multi_aud && azp.is_none() {
+    if audiences.len() > 1 && azp.is_none() {
         return Err(OidcError::InvalidIdToken(
             jose4rs::jwt::InvalidJwtError::new("azp claim required when aud has multiple values"),
         ));
@@ -921,6 +952,7 @@ mod tests {
         let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
         let jwks = build_jwks(&jwk);
         let err = verifier()
+            .with_trusted_additional_audiences(["other-client".to_owned()])
             .verify(&token, &jwks, &VerifyContext::default())
             .await
             .unwrap_err();
@@ -928,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_multi_aud_with_matching_azp() {
+    async fn requires_trusted_additional_audience_even_with_matching_azp() {
         let (priv_key, jwk) = make_keypair();
         let iat = now();
         let claims = json!({
@@ -941,7 +973,13 @@ mod tests {
         });
         let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
         let jwks = build_jwks(&jwk);
+        let err = verifier()
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidIdToken(_)));
         let parsed = verifier()
+            .with_trusted_additional_audiences(["other-client".to_owned()])
             .verify(&token, &jwks, &VerifyContext::default())
             .await
             .unwrap();
@@ -963,6 +1001,7 @@ mod tests {
         let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
         let jwks = build_jwks(&jwk);
         let err = verifier()
+            .with_trusted_additional_audiences(["other-client".to_owned()])
             .verify(&token, &jwks, &VerifyContext::default())
             .await
             .unwrap_err();

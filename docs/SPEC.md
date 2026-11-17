@@ -155,6 +155,7 @@ ID-token verification (in `token::verify::IdTokenVerifier::verify`):
 | `iss` equals expected issuer | verifier config |
 | `aud` contains expected client id | verifier config |
 | `azp` equals client id if `aud` has multiple values | verifier config |
+| Additional `aud` values must be explicitly trusted | `IdTokenVerifier::with_trusted_additional_audiences` |
 | `exp` is in the future (with configurable skew) | `JwtConsumerBuilder` |
 | `iat` is in the past (with configurable skew) | `JwtConsumerBuilder` |
 | `nbf` is in the past (with configurable skew) | `JwtConsumerBuilder` |
