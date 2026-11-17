@@ -19,6 +19,7 @@ use jose4rs::error::JoseError;
 use jose4rs::jwk::{AsyncHttpsJwks, JsonWebKey};
 use jose4rs::jws::{AlgorithmIdentifier, JsonWebSignature};
 use jose4rs::jwt::{JwtClaims, JwtConsumerBuilder};
+use jose4rs::jwx::{HeaderParameter, JsonWebStructure as _};
 
 use crate::error::OidcError;
 use crate::metadata::ProviderMetadata;
@@ -139,16 +140,17 @@ impl IdTokenVerifier {
         jwks: &AsyncHttpsJwks,
         ctx: &VerifyContext,
     ) -> Result<JwtClaims, OidcError> {
-        // 1. alg allow-list.
-        self.check_alg(&token.header_alg)?;
-        let alg_id = AlgorithmIdentifier::try_from(token.header_alg.as_str())
+        let jws = JsonWebSignature::from_compact_serialization(&token.raw)?;
+        let alg = jws.algorithm().unwrap_or("");
+        self.check_alg(alg)?;
+        let alg_id = AlgorithmIdentifier::try_from(alg)
             .map_err(|e: JoseError| OidcError::UnsupportedAlgorithm(e.to_string()))?;
 
         // 2. JWKS lookup with refresh on unknown kid.
-        let key = resolve_key(jwks, token).await?;
+        let key = resolve_key(jwks, jws.header(HeaderParameter::KeyId), alg).await?;
 
         // 3+4. Signature + claim-level validation.
-        let claims = verify_signature_and_claims(self, token, &key, ctx)?;
+        let claims = verify_signature_and_claims(self, &jws, &key, ctx)?;
 
         // 5. azp.
         check_azp(&claims, ctx, &self.expected_audience)?;
@@ -185,14 +187,13 @@ impl IdTokenVerifier {
 /// guard (`kty`/curve matching via `VerificationJwkSelector`).
 pub(crate) async fn resolve_key(
     jwks: &AsyncHttpsJwks,
-    token: &IdToken,
+    kid: Option<&str>,
+    alg: &str,
 ) -> Result<JsonWebKey, OidcError> {
-    let key = jwks
-        .select_verification_key(token.header_kid.as_deref(), &token.header_alg)
-        .await?;
+    let key = jwks.select_verification_key(kid, alg).await?;
     key.ok_or_else(|| OidcError::NoMatchingJwk {
-        kid: token.header_kid.clone(),
-        alg: token.header_alg.clone(),
+        kid: kid.map(str::to_owned),
+        alg: alg.to_owned(),
     })
 }
 
@@ -200,11 +201,10 @@ pub(crate) async fn resolve_key(
 /// payload to enforce iss/aud/exp/iat/nbf.
 fn verify_signature_and_claims(
     verifier: &IdTokenVerifier,
-    token: &IdToken,
+    jws: &JsonWebSignature,
     key: &JsonWebKey,
     ctx: &VerifyContext,
 ) -> Result<JwtClaims, OidcError> {
-    let jws = JsonWebSignature::from_compact_serialization(&token.raw).map_err(OidcError::Jose)?;
     if !jws.verify_signature(key)? {
         return Err(OidcError::InvalidIdToken(
             jose4rs::jwt::InvalidJwtError::new("JWS signature is invalid"),
@@ -617,7 +617,6 @@ mod tests {
     async fn rejects_alg_not_in_allow_list() {
         let (priv_key, jwk) = make_keypair();
         let iat = now();
-        // Sign with RS384 so alg is not allowed by the default verifier.
         let pem = priv_key.to_pkcs8_pem(LineEnding::LF).unwrap();
         let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
         let mut header = Header::new(Algorithm::RS384);
@@ -634,18 +633,15 @@ mod tests {
             &key,
         )
         .unwrap();
-        let token = IdToken::parse(&jwt).unwrap();
+        let mut token = IdToken::parse(&jwt).unwrap();
+        token.header_alg = "unrelated-cache-value".to_owned();
         let jwks = build_jwks(&jwk);
         let err = verifier()
+            .with_allowed_algs(["RS256".to_owned()])
             .verify(&token, &jwks, &VerifyContext::default())
             .await
             .unwrap_err();
-        // Either UnsupportedAlgorithm (allow-list) or Jose::InvalidKey (JWK
-        // alg restriction) is an acceptable rejection.
-        assert!(
-            matches!(err, OidcError::UnsupportedAlgorithm(ref a) if a == "RS384")
-                || matches!(err, OidcError::Jose(_))
-        );
+        assert!(matches!(err, OidcError::UnsupportedAlgorithm(ref a) if a == "RS384"));
     }
 
     #[tokio::test]

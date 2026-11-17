@@ -91,7 +91,9 @@ impl UserInfoVerifier {
         }
         AlgorithmIdentifier::try_from(token.header_alg.as_str())
             .map_err(|error| OidcError::UnsupportedAlgorithm(error.to_string()))?;
-        let key = crate::token::verify::resolve_key(jwks, &token).await?;
+        let key =
+            crate::token::verify::resolve_key(jwks, token.header_kid.as_deref(), &token.header_alg)
+                .await?;
         let jws = JsonWebSignature::from_compact_serialization(compact_jws)?;
         if !jws.verify_signature(&key)? {
             return Err(OidcError::InvalidUserInfoJwt(InvalidJwtError::new(
