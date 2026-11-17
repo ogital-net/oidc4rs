@@ -192,12 +192,10 @@ pub struct PkceCodeChallenge {
 
 impl PkceCodeChallenge {
     pub fn s256_from_verifier(v: &PkceCodeVerifier) -> Self {
-        use base64::Engine;
-
         // RFC 7636 section 4.2: challenge = BASE64URL-ENCODE(SHA256(verifier))
         // with no padding. SHA-256 here is infallible (see crypto::hash).
         let digest = crate::crypto::sha256(v.as_str().as_bytes());
-        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        let value = base64_simd::URL_SAFE_NO_PAD.encode_to_string(digest);
         Self {
             method: PkceCodeChallengeMethod::S256,
             value,
@@ -374,11 +372,9 @@ nonempty_string_newtype!(
 
 /// Generates a url-safe base64 (no padding) string from `n` random bytes.
 fn random_url_safe(n: usize) -> String {
-    use base64::Engine;
-
     let mut bytes = vec![0u8; n];
     fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+    base64_simd::URL_SAFE_NO_PAD.encode_to_string(&bytes)
 }
 
 #[cfg(test)]

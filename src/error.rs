@@ -62,7 +62,7 @@ pub enum OidcError {
     Json(#[from] serde_json::Error),
 
     #[error("base64 decode error: {0}")]
-    Base64(#[from] base64::DecodeError),
+    Base64(#[from] base64_simd::Error),
 
     #[error("authorization response error: {0}")]
     AuthorizationResponse(#[from] crate::flow::callback::CallbackError),

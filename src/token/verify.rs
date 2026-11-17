@@ -15,7 +15,6 @@
 
 use std::time::Duration;
 
-use base64::Engine;
 use jose4rs::error::JoseError;
 use jose4rs::jwk::{AsyncHttpsJwks, JsonWebKey};
 use jose4rs::jws::{AlgorithmIdentifier, JsonWebSignature};
@@ -395,30 +394,30 @@ fn calculate_at_hash(
         | AlgorithmIdentifier::EcdsaUsingP256CurveAndSha256
         | AlgorithmIdentifier::RsaPssUsingSha256 => {
             let digest = crate::crypto::sha256(token);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
         #[cfg(not(feature = "boring"))]
         AlgorithmIdentifier::EcdsaUsingSecp256k1CurveAndSha256 => {
             let digest = crate::crypto::sha256(token);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
         AlgorithmIdentifier::HmacSha384
         | AlgorithmIdentifier::RsaUsingSha384
         | AlgorithmIdentifier::EcdsaUsingP384CurveAndSha384
         | AlgorithmIdentifier::RsaPssUsingSha384 => {
             let digest = crate::crypto::sha384(token);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
         AlgorithmIdentifier::HmacSha512
         | AlgorithmIdentifier::RsaUsingSha512
         | AlgorithmIdentifier::EcdsaUsingP521CurveAndSha512
         | AlgorithmIdentifier::RsaPssUsingSha512 => {
             let digest = crate::crypto::sha512(token);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
         AlgorithmIdentifier::EdDsa if key_curve == Some("Ed25519") => {
             let digest = crate::crypto::sha512(token);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
         AlgorithmIdentifier::None | AlgorithmIdentifier::EdDsa => {
             return Err(OidcError::UnsupportedAlgorithm(format!(
@@ -766,8 +765,7 @@ mod tests {
         let iat = now();
         let access_token = "AT-VALUE-123";
         let digest = sha2::Sha256::digest(access_token.as_bytes());
-        let at_hash =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2]);
+        let at_hash = base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2]);
         let claims = json!({
             "iss": "https://idp.example.com",
             "aud": "my-client",
@@ -794,7 +792,7 @@ mod tests {
         let sha384 = sha2::Sha384::digest(access_token.as_bytes());
         let sha512 = sha2::Sha512::digest(access_token.as_bytes());
         let encode_left = |digest: &[u8]| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         };
 
         assert_eq!(

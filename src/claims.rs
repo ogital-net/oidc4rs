@@ -54,14 +54,10 @@ impl OidcClaims for JwtClaims {
 }
 
 fn decode_hash_claim(claims: &JwtClaims, name: &str) -> Result<Option<Vec<u8>>, OidcError> {
-    use base64::Engine;
-
     let Some(s) = claims.string_claim(name) else {
         return Ok(None);
     };
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s)
-        .map_err(OidcError::Base64)?;
+    let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(s)?;
     Ok(Some(bytes))
 }
 

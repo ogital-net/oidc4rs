@@ -13,8 +13,6 @@
 //! can override with [`CodeTokenRequest::auth_method`] /
 //! [`RefreshTokenRequest::auth_method`].
 
-use base64::Engine;
-
 use crate::error::OidcError;
 use crate::transport::http::{HttpMethod, HttpRequest};
 use crate::types::{ClientId, ClientSecret, RefreshToken, TokenEndpointAuthMethod, TokenUrl};
@@ -210,7 +208,7 @@ impl CodeTokenRequest {
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 );
                 let creds = format!("{client_id}:{client_secret}");
-                let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
+                let encoded = base64_simd::STANDARD.encode_to_string(creds);
                 headers.push(("Authorization".into(), format!("Basic {encoded}")));
             }
             TokenAuthMethod::ClientSecretPost => {
@@ -320,7 +318,7 @@ impl RefreshTokenRequest {
                     self.client_secret.as_ref().map_or("", ClientSecret::as_str),
                 );
                 let creds = format!("{client_id}:{client_secret}");
-                let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
+                let encoded = base64_simd::STANDARD.encode_to_string(creds);
                 headers.push(("Authorization".into(), format!("Basic {encoded}")));
             }
             TokenAuthMethod::ClientSecretPost => {
@@ -415,9 +413,7 @@ mod tests {
             .unwrap();
         assert!(h.1.starts_with("Basic "));
         let creds_b64 = h.1.trim_start_matches("Basic ");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(creds_b64)
-            .unwrap();
+        let decoded = base64_simd::STANDARD.decode_to_vec(creds_b64).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "my-client:secret");
         let body = String::from_utf8(req.http.body.clone().unwrap()).unwrap();
         assert!(body.contains("grant_type=authorization_code"));
@@ -553,8 +549,8 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "Authorization")
             .unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(header.1.trim_start_matches("Basic "))
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(header.1.trim_start_matches("Basic "))
             .unwrap();
 
         assert_eq!(
