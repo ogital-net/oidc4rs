@@ -86,6 +86,10 @@ hyper = [
     "dep:bytes",
 ]
 
+[[example]]
+name = "hyper_adapter"
+required-features = ["hyper"]
+
 [dev-dependencies]
 # Test-only async runtime. The crate itself is runtime-agnostic;
 # tokio is the de-facto choice for in-crate async tests.
