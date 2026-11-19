@@ -14,6 +14,7 @@ use crate::flow::token::{
 };
 use crate::metadata::{CachePolicy, ProviderMetadata};
 use crate::token::response::{IdToken, TokenResponse};
+use crate::token::verify::{DEFAULT_ALLOWED_ALGS, IdTokenVerifier};
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::transport::kv::AsyncKvStore;
 use crate::types::{AccessToken, ClientId, ClientSecret, RefreshToken};
@@ -38,6 +39,7 @@ pub struct Client {
     pub(crate) client_id: ClientId,
     pub(crate) client_secret: Option<ClientSecret>,
     token_auth_method: Option<TokenAuthMethod>,
+    id_token_signing_alg: &'static str,
     pub(crate) http: Arc<dyn AsyncHttpClient>,
 }
 
@@ -147,6 +149,7 @@ impl Client {
             client_id,
             client_secret,
             token_auth_method: None,
+            id_token_signing_alg: "RS256",
             http,
         })
     }
@@ -183,6 +186,7 @@ impl Client {
             client_id,
             client_secret,
             token_auth_method: None,
+            id_token_signing_alg: "RS256",
             http,
         })
     }
@@ -683,22 +687,30 @@ impl Client {
         ))
     }
 
-    /// Builds an [`IdTokenVerifier`](crate::token::verify::IdTokenVerifier)
-    /// pre-wired for this relying party:
-    /// - `expected_issuer` is taken from the discovery document.
-    /// - `expected_audience` is `self.client_id().as_str()`.
-    /// - The `allowed_algs` list is narrowed to whatever the OP
-    ///   advertised in `id_token_signing_alg_values_supported`, so
-    ///   the verifier cannot be tricked into accepting a `none` or
-    ///   weaker algorithm the OP has stopped using.
+    /// Sets the `id_token_signed_response_alg` registered for this client.
+    /// The default is `RS256`. Only supported asymmetric signing algorithms
+    /// can be configured.
+    pub fn with_id_token_signing_alg(mut self, alg: &str) -> Result<Self, OidcError> {
+        self.id_token_signing_alg = DEFAULT_ALLOWED_ALGS
+            .iter()
+            .copied()
+            .find(|supported| *supported == alg)
+            .ok_or_else(|| OidcError::UnsupportedAlgorithm(alg.to_owned()))?;
+        Ok(self)
+    }
+
+    /// Builds a verifier for this client's issuer, audience, and registered
+    /// ID-token signing algorithm (or the OIDC default of `RS256`). The
+    /// provider-wide discovery list does not broaden this algorithm policy.
     ///
     /// Callers can further narrow or widen the list with
     /// `IdTokenVerifier::allow_alg` /
     /// `IdTokenVerifier::with_allowed_algs` before passing the
     /// verifier to `verify` / `verify_id_token`.
-    pub fn verifier(&self) -> crate::token::verify::IdTokenVerifier {
+    pub fn verifier(&self) -> IdTokenVerifier {
         let metadata = self.metadata();
-        crate::token::verify::IdTokenVerifier::from_metadata(&metadata, self.client_id().as_str())
+        IdTokenVerifier::new(metadata.issuer.as_str(), self.client_id().as_str())
+            .with_allowed_algs([self.id_token_signing_alg.to_owned()])
     }
 
     /// Begins building an RP-initiated logout URL (OIDC RP-Initiated
@@ -2248,6 +2260,27 @@ mod tests {
             }
             other => panic!("expected TokenEndpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_verifier_uses_only_the_registered_id_token_algorithm() {
+        let mut metadata = provider_metadata();
+        metadata.id_token_signing_alg_values_supported = vec!["RS256".into(), "ES256".into()];
+        let client = Client::from_parts(
+            metadata,
+            ClientId::new("client").unwrap(),
+            None,
+            Arc::new(MockHttp::new(vec![])),
+        )
+        .unwrap();
+
+        assert_eq!(client.verifier().allowed_algs(), ["RS256"]);
+        let client = client.with_id_token_signing_alg("ES256").unwrap();
+        assert_eq!(client.verifier().allowed_algs(), ["ES256"]);
+        assert!(matches!(
+            client.with_id_token_signing_alg("none"),
+            Err(OidcError::UnsupportedAlgorithm(_))
+        ));
     }
 
     #[test]
