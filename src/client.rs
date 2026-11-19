@@ -9,7 +9,9 @@ use jose4rs::jwk::{AsyncHttpsJwks, AsyncJwksFetcher, FetchResponse};
 use crate::error::OidcError;
 use crate::flow::authorize::PendingAuthRequest;
 use crate::flow::callback::{AuthorizationResponse, CallbackError, parse_authorization_response};
-use crate::flow::token::{BuiltTokenRequest, CodeTokenRequest, RefreshTokenRequest};
+use crate::flow::token::{
+    BuiltTokenRequest, CodeTokenRequest, RefreshTokenRequest, TokenAuthMethod,
+};
 use crate::metadata::{CachePolicy, ProviderMetadata};
 use crate::token::response::{IdToken, TokenResponse};
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
@@ -35,6 +37,7 @@ pub struct Client {
     metadata_refresh_lock: AsyncMutex<()>,
     pub(crate) client_id: ClientId,
     pub(crate) client_secret: Option<ClientSecret>,
+    token_auth_method: Option<TokenAuthMethod>,
     pub(crate) http: Arc<dyn AsyncHttpClient>,
 }
 
@@ -143,6 +146,7 @@ impl Client {
             metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
+            token_auth_method: None,
             http,
         })
     }
@@ -178,6 +182,7 @@ impl Client {
             metadata_refresh_lock: AsyncMutex::new(()),
             client_id,
             client_secret,
+            token_auth_method: None,
             http,
         })
     }
@@ -204,6 +209,33 @@ impl Client {
 
     pub fn client_id(&self) -> &ClientId {
         &self.client_id
+    }
+
+    /// Sets the token endpoint authentication method registered for this client.
+    /// Code exchange and refresh use this setting, not the provider-wide
+    /// discovery list. By default, clients with a secret use
+    /// `client_secret_basic` and public clients use `none`.
+    ///
+    /// Secret-based methods require a client secret; `none` requires a
+    /// client constructed without one.
+    pub fn with_token_auth_method(mut self, method: TokenAuthMethod) -> Result<Self, OidcError> {
+        if self.client_secret.is_some() != (method != TokenAuthMethod::None) {
+            return Err(OidcError::InvalidAuthorizationRequest(format!(
+                "{} does not match the client's credential configuration",
+                method.as_str()
+            )));
+        }
+        self.token_auth_method = Some(method);
+        Ok(self)
+    }
+
+    fn token_auth_method(&self) -> TokenAuthMethod {
+        self.token_auth_method
+            .unwrap_or(if self.client_secret.is_some() {
+                TokenAuthMethod::ClientSecretBasic
+            } else {
+                TokenAuthMethod::None
+            })
     }
 
     /// Returns the JWKS cache used to verify this OP's ID tokens.
@@ -519,7 +551,7 @@ impl Client {
             }
         };
 
-        let mut builder: CodeTokenRequest = self.exchange_code_with_metadata(code, &metadata)?;
+        let mut builder = self.exchange_code_with_metadata(code, &metadata);
         if let Some(uri) = pending.redirect_uri.as_deref() {
             builder = builder.redirect_uri(uri);
         }
@@ -540,26 +572,21 @@ impl Client {
     /// short-lived authorization code from the OP callback.
     pub fn exchange_code(&self, code: String) -> Result<CodeTokenRequest, OidcError> {
         let metadata = self.metadata();
-        self.exchange_code_with_metadata(code, &metadata)
+        Ok(self.exchange_code_with_metadata(code, &metadata))
     }
 
     fn exchange_code_with_metadata(
         &self,
         code: String,
         metadata: &ProviderMetadata,
-    ) -> Result<CodeTokenRequest, OidcError> {
-        let supported = metadata.token_endpoint_auth_methods_supported.as_deref();
-        let method = crate::flow::token::TokenAuthMethod::from_metadata(
-            supported,
-            self.client_secret.is_some(),
-        )?;
-        Ok(CodeTokenRequest::new(
+    ) -> CodeTokenRequest {
+        CodeTokenRequest::new(
             metadata.token_endpoint.clone(),
             self.client_id().clone(),
             self.client_secret.clone(),
             code,
-            Some(method),
-        ))
+            Some(self.token_auth_method()),
+        )
     }
 
     /// Fetches the OIDC userinfo claims for `access_token`.
@@ -647,17 +674,12 @@ impl Client {
         refresh_token: RefreshToken,
     ) -> Result<RefreshTokenRequest, OidcError> {
         let metadata = self.metadata();
-        let supported = metadata.token_endpoint_auth_methods_supported.as_deref();
-        let method = crate::flow::token::TokenAuthMethod::from_metadata(
-            supported,
-            self.client_secret.is_some(),
-        )?;
         Ok(RefreshTokenRequest::new(
             metadata.token_endpoint.clone(),
             self.client_id().clone(),
             self.client_secret.clone(),
             refresh_token,
-            Some(method),
+            Some(self.token_auth_method()),
         ))
     }
 
@@ -1701,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_authorization_from_pending_exchanges_without_store() {
+    async fn registered_post_auth_is_used_for_callback_and_refresh() {
         let token_resp = serde_json::json!({
             "access_token": "AT-1",
             "token_type": "Bearer",
@@ -1714,12 +1736,19 @@ mod tests {
             headers: vec![("content-type".into(), "application/json".into())],
             body: token_resp,
         }]));
+        let mut metadata = provider_metadata();
+        metadata.token_endpoint_auth_methods_supported = Some(vec![
+            "client_secret_basic".into(),
+            "client_secret_post".into(),
+        ]);
         let client = Client::from_parts(
-            provider_metadata(),
+            metadata,
             ClientId::new("my-client").unwrap(),
             Some(ClientSecret::new("secret").unwrap()),
-            http,
+            http.clone(),
         )
+        .unwrap()
+        .with_token_auth_method(TokenAuthMethod::ClientSecretPost)
         .unwrap();
         let response = AuthorizationResponse::Success {
             code: "AUTH-CODE".into(),
@@ -1743,6 +1772,27 @@ mod tests {
 
         assert_eq!(result.callback_state, "consumed-state");
         assert_eq!(result.token_response.access_token.as_str(), "AT-1");
+
+        let callback_request = http.last_request.lock().unwrap().take().unwrap();
+        let refresh_request = client
+            .exchange_refresh_token(RefreshToken::new("refresh-token").unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .http;
+        for request in [callback_request, refresh_request] {
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .all(|(name, _)| name != "Authorization")
+            );
+            let body = request.body.unwrap();
+            let form: std::collections::HashMap<_, _> =
+                url::form_urlencoded::parse(&body).collect();
+            assert_eq!(form.get("client_id").map(AsRef::as_ref), Some("my-client"));
+            assert_eq!(form.get("client_secret").map(AsRef::as_ref), Some("secret"));
+        }
     }
 
     #[tokio::test]
@@ -2219,10 +2269,12 @@ mod tests {
     }
 
     #[test]
-    fn exchange_code_picks_none_when_no_secret() {
+    fn exchange_code_picks_none_when_discovery_omits_none() {
         let http = Arc::new(MockHttp::new(vec![]));
+        let mut metadata = provider_metadata();
+        metadata.token_endpoint_auth_methods_supported = Some(vec!["client_secret_basic".into()]);
         let client = Client::from_parts(
-            provider_metadata(),
+            metadata,
             ClientId::new("c").unwrap(),
             None,
             http as Arc<dyn AsyncHttpClient>,
