@@ -426,7 +426,18 @@ impl Client {
     /// - `callback_query`: the query (or fragment) string from the
     ///   OP redirect, e.g. `"code=...&state=..."`. Leading `?` / `#`
     ///   are not stripped automatically; pass the part after.
-    /// - `kv`: the shared store backing the second leg (Redis, etc.).
+    /// - `kv`: a view of the pending-request store scoped to the current
+    ///   browser session. Use the same scope when storing the request.
+    ///
+    /// For web applications, use an HTTPS callback and bind the pending
+    /// request to the browser session that started login (RFC 9700 section
+    /// 2.1). For example, use a server-issued session ID carried in a
+    /// `Secure`, `HttpOnly`, `SameSite=Lax` cookie for a top-level GET
+    /// callback. At login, store the pending request under that session ID
+    /// and `state`. At callback, obtain the session ID independently from
+    /// the cookie, reject a missing session, and use that session's store
+    /// view to atomically take the request. Looking up `state` in a global
+    /// store without checking the originating session is not sufficient.
     ///
     /// Behavior:
     /// 1. Parses the callback.
@@ -439,9 +450,9 @@ impl Client {
     ///    snapshot for downstream logic (e.g. nonce verification).
     ///
     /// The ID-token verification step is *not* performed here. Callers
-    /// must run [`crate::token::verify::IdTokenVerifier::verify`] on
-    /// `token_response.id_token()` before trusting any claim. Use
-    /// [`CompleteAuthorization::verify_id_token`] as a convenience.
+    /// must call [`CompleteAuthorization::verify_id_token`] (or perform
+    /// equivalent verification) before using any returned token or
+    /// establishing a logged-in session.
     pub async fn complete_authorization(
         &self,
         callback_query: &str,
@@ -461,7 +472,10 @@ impl Client {
     /// The caller consumes and decodes its transaction, resolves this client,
     /// then passes the embedded [`PendingAuthRequest`] here. This method still
     /// validates the callback issuer, state binding, and pending-request age
-    /// before making the token request.
+    /// before making the token request. The caller must take the pending
+    /// request from the initiating browser session, as described in
+    /// [`complete_authorization`](Self::complete_authorization), before
+    /// calling this method.
     pub async fn complete_authorization_from_pending(
         &self,
         response: AuthorizationResponse,
