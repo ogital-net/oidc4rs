@@ -786,6 +786,7 @@ impl CompleteAuthorization {
             client_id: Some(client_id.to_owned()),
             clock_skew: None,
             expected_max_age: self.pending.max_age,
+            authorization_started_at: Some(self.pending.created_at),
         };
         verifier.verify(&id_token, jwks, &ctx).await
     }

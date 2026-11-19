@@ -39,8 +39,12 @@ pub struct VerifyContext {
     /// checks. Defaults to zero.
     pub clock_skew: Option<Duration>,
     /// Requested `max_age`. When set, the ID token must contain a
-    /// valid `auth_time` no older than this duration.
+    /// valid `auth_time`. A zero value requires fresh authentication
+    /// for the current request rather than a zero-second callback delay.
     pub expected_max_age: Option<Duration>,
+    /// Time the authorization request was created. Required when
+    /// `expected_max_age` is zero.
+    pub authorization_started_at: Option<std::time::SystemTime>,
 }
 
 /// The default algorithm allow-list used by [`IdTokenVerifier::new`].
@@ -348,11 +352,24 @@ fn check_auth_time(claims: &JwtClaims, ctx: &VerifyContext) -> Result<(), OidcEr
             jose4rs::jwt::InvalidJwtError::new("auth_time claim is in the future"),
         ));
     }
-    if auth_time
-        .checked_add(max_age)
-        .and_then(|deadline| deadline.checked_add(skew))
-        .is_some_and(|deadline| now > deadline)
-    {
+    let too_old = if max_age.is_zero() {
+        let started_at = ctx.authorization_started_at.ok_or_else(|| {
+            OidcError::InvalidAuthorizationRequest(
+                "authorization start time is required for max_age=0".into(),
+            )
+        })?;
+        let earliest = started_at
+            .checked_sub(skew)
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        seconds < earliest.as_secs()
+    } else {
+        auth_time
+            .checked_add(max_age)
+            .and_then(|deadline| deadline.checked_add(skew))
+            .is_some_and(|deadline| now > deadline)
+    };
+    if too_old {
         return Err(OidcError::InvalidIdToken(
             jose4rs::jwt::InvalidJwtError::new("authentication exceeds requested max_age"),
         ));
@@ -755,6 +772,40 @@ mod tests {
 
         let mut claims = base;
         claims["auth_time"] = json!(iat - 120);
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        verifier().verify(&token, &jwks, &ctx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_age_zero_requires_authentication_during_the_request() {
+        let (priv_key, jwk) = make_keypair();
+        let issued_at = now();
+        let started_at = issued_at - 60;
+        let ctx = VerifyContext {
+            expected_max_age: Some(Duration::ZERO),
+            authorization_started_at: Some(
+                std::time::UNIX_EPOCH
+                    + Duration::from_secs(u64::try_from(started_at).unwrap())
+                    + Duration::from_millis(500),
+            ),
+            ..Default::default()
+        };
+        let jwks = build_jwks(&jwk);
+        let mut claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "sub": "user-1",
+            "exp": issued_at + 3600,
+            "iat": issued_at,
+        });
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        assert!(verifier().verify(&token, &jwks, &ctx).await.is_err());
+
+        claims["auth_time"] = json!(started_at - 1);
+        let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
+        assert!(verifier().verify(&token, &jwks, &ctx).await.is_err());
+
+        claims["auth_time"] = json!(started_at);
         let token = IdToken::parse(sign_id_token(&priv_key, &claims)).unwrap();
         verifier().verify(&token, &jwks, &ctx).await.unwrap();
     }
