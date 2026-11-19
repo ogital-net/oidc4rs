@@ -169,25 +169,31 @@ https_url_newtype!(
 /// Redirect URI registered with the OP. Custom schemes are permitted for
 /// native apps, so we do not enforce `https` here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RedirectUrl(Url);
+pub struct RedirectUrl {
+    url: Url,
+    serialized: String,
+}
 
 impl RedirectUrl {
+    /// Returns the parsed URL, which may have been normalized.
     pub fn as_url(&self) -> &Url {
-        &self.0
+        &self.url
     }
 
+    /// Returns the exact URI string to send to the provider.
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.serialized
     }
 
+    /// Returns the parsed URL, discarding the original spelling.
     pub fn into_inner(self) -> Url {
-        self.0
+        self.url
     }
 }
 
 impl fmt::Display for RedirectUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        f.write_str(self.as_str())
     }
 }
 
@@ -196,13 +202,21 @@ impl FromStr for RedirectUrl {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let url = Url::parse(s).map_err(|e| OidcError::InvalidUrl(e.to_string()))?;
-        Ok(Self(url))
+        if url.fragment().is_some() {
+            return Err(OidcError::InvalidUrl(
+                "RedirectUrl must not contain a fragment".into(),
+            ));
+        }
+        Ok(Self {
+            url,
+            serialized: s.to_owned(),
+        })
     }
 }
 
 impl Serialize for RedirectUrl {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.0.as_str())
+        s.serialize_str(self.as_str())
     }
 }
 
@@ -215,7 +229,7 @@ impl<'de> Deserialize<'de> for RedirectUrl {
 
 impl AsRef<Url> for RedirectUrl {
     fn as_ref(&self) -> &Url {
-        &self.0
+        self.as_url()
     }
 }
 
@@ -227,21 +241,26 @@ impl AsRef<Url> for RedirectUrl {
 /// Custom schemes are permitted for native apps, so we do not
 /// enforce `https` here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PostLogoutRedirectUrl(Url);
+pub struct PostLogoutRedirectUrl {
+    url: Url,
+    serialized: String,
+}
 
 impl PostLogoutRedirectUrl {
+    /// Returns the parsed URL, which may have been normalized.
     pub fn as_url(&self) -> &Url {
-        &self.0
+        &self.url
     }
 
+    /// Returns the exact URI string to send to the provider.
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.serialized
     }
 }
 
 impl fmt::Display for PostLogoutRedirectUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        f.write_str(self.as_str())
     }
 }
 
@@ -250,13 +269,16 @@ impl FromStr for PostLogoutRedirectUrl {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let url = Url::parse(s).map_err(|e| OidcError::InvalidUrl(e.to_string()))?;
-        Ok(Self(url))
+        Ok(Self {
+            url,
+            serialized: s.to_owned(),
+        })
     }
 }
 
 impl Serialize for PostLogoutRedirectUrl {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.0.as_str())
+        s.serialize_str(self.as_str())
     }
 }
 
@@ -269,13 +291,38 @@ impl<'de> Deserialize<'de> for PostLogoutRedirectUrl {
 
 impl AsRef<Url> for PostLogoutRedirectUrl {
     fn as_ref(&self) -> &Url {
-        &self.0
+        self.as_url()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_types_preserve_exact_serialized_value() {
+        let registered = "https://App.example.com:443/callback?tenant=example";
+        let encoded = serde_json::to_string(registered).unwrap();
+        let redirect: RedirectUrl = serde_json::from_str(&encoded).unwrap();
+        let logout_redirect: PostLogoutRedirectUrl = serde_json::from_str(&encoded).unwrap();
+
+        assert_ne!(redirect.as_str(), redirect.as_url().as_str());
+        assert_eq!(redirect.to_string(), registered);
+        assert_eq!(serde_json::to_string(&redirect).unwrap(), encoded);
+        assert_ne!(logout_redirect.as_str(), logout_redirect.as_url().as_str());
+        assert_eq!(logout_redirect.to_string(), registered);
+        assert_eq!(serde_json::to_string(&logout_redirect).unwrap(), encoded);
+    }
+
+    #[test]
+    fn authorization_redirect_rejects_fragments() {
+        assert!(
+            "https://app.example.com/callback#"
+                .parse::<RedirectUrl>()
+                .is_err()
+        );
+        assert!("myapp:/callback#fragment".parse::<RedirectUrl>().is_err());
+    }
 
     #[test]
     fn issuer_preserves_exact_serialized_value() {
