@@ -23,7 +23,7 @@ use jose4rs::jwx::{HeaderParameter, JsonWebStructure as _};
 
 use crate::error::OidcError;
 use crate::metadata::ProviderMetadata;
-use crate::token::response::IdToken;
+use crate::token::response::{IdToken, TokenResponse};
 
 /// Context the caller supplies per verification.
 #[derive(Debug, Clone, Default)]
@@ -190,6 +190,31 @@ impl IdTokenVerifier {
         Ok(claims)
     }
 
+    /// Validates any ID token in a refresh response against the verified ID
+    /// token claims from the original authentication (OIDC Core section 12.2).
+    /// Pass the original claims, not those from a previous refresh.
+    /// A response without an ID token returns `Ok(None)` and does not change
+    /// the authenticated identity. If the refreshed token includes `auth_time`,
+    /// the original token must also have recorded it to establish continuity.
+    pub async fn verify_refresh_response(
+        &self,
+        response: &TokenResponse,
+        original: &JwtClaims,
+        jwks: &AsyncHttpsJwks,
+    ) -> Result<Option<JwtClaims>, OidcError> {
+        let Some(raw) = response.id_token() else {
+            return Ok(None);
+        };
+        let token = IdToken::parse(raw)?;
+        let context = VerifyContext {
+            access_token: Some(response.access_token.as_str().to_owned()),
+            ..VerifyContext::default()
+        };
+        let refreshed = self.verify(&token, jwks, &context).await?;
+        check_refresh_continuity(original, &refreshed)?;
+        Ok(Some(refreshed))
+    }
+
     fn check_alg(&self, alg: &str) -> Result<(), OidcError> {
         // `none` is never acceptable, even if a caller widened the
         // allow-list: an unsecured JWS carries no signature to verify.
@@ -203,6 +228,64 @@ impl IdTokenVerifier {
         }
         Ok(())
     }
+}
+
+fn refresh_claim_mismatch(claim: &str) -> OidcError {
+    OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(format!(
+        "refreshed ID token has inconsistent {claim}"
+    )))
+}
+
+fn check_refresh_continuity(original: &JwtClaims, refreshed: &JwtClaims) -> Result<(), OidcError> {
+    if refreshed.issuer() != original.issuer() {
+        return Err(refresh_claim_mismatch("iss"));
+    }
+    if refreshed.subject() != original.subject() {
+        return Err(refresh_claim_mismatch("sub"));
+    }
+    let audience_set = |claims: &JwtClaims| {
+        let mut audiences = claims.audience().unwrap_or_default();
+        audiences.sort_unstable();
+        audiences.dedup();
+        audiences
+    };
+    if audience_set(refreshed) != audience_set(original) {
+        return Err(refresh_claim_mismatch("aud"));
+    }
+    if refreshed
+        .issued_at()
+        .zip(original.issued_at())
+        .is_none_or(|(refreshed_at, original_at)| refreshed_at < original_at)
+    {
+        return Err(refresh_claim_mismatch("iat"));
+    }
+    if refreshed.has_claim("nonce") {
+        let matches = refreshed
+            .string_claim("nonce")
+            .zip(original.string_claim("nonce"))
+            .is_some_and(|(actual, expected)| {
+                crate::crypto::ct_equals(actual.as_bytes(), expected.as_bytes())
+            });
+        if !matches {
+            return Err(refresh_claim_mismatch("nonce"));
+        }
+    }
+    if refreshed.has_claim("auth_time") {
+        let original_json: serde_json::Value = serde_json::from_str(&original.to_json())?;
+        let refreshed_json: serde_json::Value = serde_json::from_str(&refreshed.to_json())?;
+        let auth_time = refreshed_json
+            .get("auth_time")
+            .and_then(serde_json::Value::as_number);
+        if auth_time.is_none()
+            || auth_time
+                != original_json
+                    .get("auth_time")
+                    .and_then(serde_json::Value::as_number)
+        {
+            return Err(refresh_claim_mismatch("auth_time"));
+        }
+    }
+    Ok(())
 }
 
 /// Looks up the signing key via `AsyncHttpsJwks::select_verification_key`.
@@ -555,6 +638,80 @@ mod tests {
         let ctx = VerifyContext::default();
         let parsed = verifier().verify(&token, &jwks, &ctx).await.unwrap();
         assert_eq!(parsed.subject().unwrap(), "user-42");
+    }
+
+    #[tokio::test]
+    async fn refresh_response_preserves_the_original_authentication() {
+        let (priv_key, jwk) = make_keypair();
+        let issued_at = now();
+        let original_claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": ["my-client", "trusted-client"],
+            "azp": "my-client",
+            "sub": "user-1",
+            "exp": issued_at + 3600,
+            "iat": issued_at - 60,
+            "auth_time": issued_at - 120,
+            "nonce": "original-nonce",
+        });
+        let jwks = build_jwks(&jwk);
+        let verifier = verifier().with_trusted_additional_audiences(["trusted-client".into()]);
+        let token = IdToken::parse(sign_id_token(&priv_key, &original_claims)).unwrap();
+        let original = verifier
+            .verify(&token, &jwks, &VerifyContext::default())
+            .await
+            .unwrap();
+        let mut response: TokenResponse = serde_json::from_value(json!({
+            "access_token": "refreshed-access-token",
+            "token_type": "Bearer",
+        }))
+        .unwrap();
+        assert!(
+            verifier
+                .verify_refresh_response(&response, &original, &jwks)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut claims = original_claims;
+        claims["iat"] = json!(issued_at);
+        claims["aud"] = json!(["trusted-client", "my-client"]);
+        response.id_token = Some(sign_id_token(&priv_key, &claims));
+        assert!(
+            verifier
+                .verify_refresh_response(&response, &original, &jwks)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        claims.as_object_mut().unwrap().remove("nonce");
+        response.id_token = Some(sign_id_token(&priv_key, &claims));
+        assert!(
+            verifier
+                .verify_refresh_response(&response, &original, &jwks)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        for (claim, value) in [
+            ("sub", json!("another-user")),
+            ("aud", json!("my-client")),
+            ("auth_time", json!(issued_at)),
+            ("nonce", json!("different-nonce")),
+            ("iat", json!(issued_at - 61)),
+        ] {
+            let mut inconsistent = claims.clone();
+            inconsistent[claim] = value;
+            response.id_token = Some(sign_id_token(&priv_key, &inconsistent));
+            let error = verifier
+                .verify_refresh_response(&response, &original, &jwks)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(&format!("inconsistent {claim}")));
+        }
     }
 
     #[tokio::test]

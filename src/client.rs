@@ -692,6 +692,9 @@ impl Client {
 
     /// Begins a refresh-token grant. See [`RefreshTokenRequest`] for
     /// customization (scope, auth method).
+    /// After sending the request, use
+    /// [`IdTokenVerifier::verify_refresh_response`] to verify any returned
+    /// ID token against the original authentication before using its claims.
     pub fn exchange_refresh_token(
         &self,
         refresh_token: RefreshToken,
