@@ -1,0 +1,62 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: [start-dev, --import-realm]
+    environment:
+      KC_HOSTNAME: https://keycloak:8443
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_SCHEME: http
+      KC_HTTPS_CERTIFICATE_FILE: /tls/server.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /tls/server.key
+    volumes:
+      - ./realm.json:/opt/keycloak/data/import/interop-realm.json:ro
+      - ${INTEROP_CERT_DIR:?run tests/interop/run.sh}/server.crt:/tls/server.crt:ro
+      - ${INTEROP_CERT_DIR:?run tests/interop/run.sh}/server.key:/tls/server.key:ro
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          read -r result <&3;
+          [[ "$$result" == 'HTTP/1.1 200 '* ]]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+  rp:
+    init: true
+    build:
+      context: ../..
+      dockerfile: tests/interop/Dockerfile
+      target: rp
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      OIDC_ISSUER: https://keycloak:8443/realms/interop
+      OIDC_CLIENT_ID: oidc4rs-interop
+      OIDC_CLIENT_SECRET: interop-client-test-only
+      OIDC_REDIRECT_URI: http://rp:8080/callback
+      SSL_CERT_FILE: /tls/ca.crt
+    volumes:
+      - ${INTEROP_CERT_DIR:?run tests/interop/run.sh}/ca.crt:/tls/ca.crt:ro
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/health]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+  browser:
+    build:
+      context: ../..
+      dockerfile: tests/interop/Dockerfile
+      target: browser
+    init: true
+    shm_size: 256m
+    volumes:
+      - ${INTEROP_CERT_DIR:?run tests/interop/run.sh}/ca.crt:/tls/ca.crt:ro
+
+networks:
+  default:
+    internal: true

@@ -1,0 +1,15 @@
+[req]
+distinguished_name = dn
+
+[dn]
+
+[ca_extensions]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+
+[server_extensions]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:keycloak

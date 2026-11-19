@@ -1,0 +1,19 @@
+name: OIDC interop
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keycloak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Run Keycloak browser smoke test
+        run: sh tests/interop/run.sh

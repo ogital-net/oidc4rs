@@ -1,0 +1,33 @@
+{
+  "realm": "interop",
+  "enabled": true,
+  "sslRequired": "all",
+  "clients": [
+    {
+      "clientId": "oidc4rs-interop",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "interop-client-test-only",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://rp:8080/callback"],
+      "attributes": { "pkce.code.challenge.method": "S256" }
+    }
+  ],
+  "users": [
+    {
+      "id": "bca87614-8100-404a-b7e8-983539cdb5c4",
+      "username": "interop-user",
+      "firstName": "Interop",
+      "lastName": "User",
+      "email": "interop@example.test",
+      "emailVerified": true,
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "interop-test-only", "temporary": false }
+      ]
+    }
+  ]
+}

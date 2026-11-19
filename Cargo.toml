@@ -90,10 +90,16 @@ hyper = [
 name = "hyper_adapter"
 required-features = ["hyper"]
 
+[[example]]
+name = "interop_rp"
+path = "tests/interop/rp.rs"
+required-features = ["hyper"]
+
 [dev-dependencies]
 # Test-only async runtime. The crate itself is runtime-agnostic;
 # tokio is the de-facto choice for in-crate async tests.
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "net", "rt"] }
+hyper = { version = "1", features = ["server"] }
 futures = "0.3"
 jsonwebtoken = "9"
 rsa = "0.9"

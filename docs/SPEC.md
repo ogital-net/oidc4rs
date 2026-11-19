@@ -303,8 +303,25 @@ children once their parent is done.
 ### 8.10 Testing
 
 - [x] Unit tests for all wrapper functions
+- [x] Browser interoperability smoke test against Keycloak
 - [ ] Integration test against a mock OIDC server (e.g. `oidc-testprovider` from mozilla-django-oidc) behind a feature flag
 - [ ] Snapshot tests for `parse_authorization_response`
+
+Run the Keycloak smoke test from the repository root with Docker Compose
+and OpenSSL installed:
+
+```sh
+sh tests/interop/run.sh
+```
+
+The runner uses a private Docker network, a temporary CA, and a seeded
+confidential client that requires S256 PKCE. Chromium signs in and checks
+that `oidc4rs` verifies the ID token and retrieves `profile` and `email`
+claims from UserInfo for the same subject, even when an optional claim is
+absent.
+The containers and certificates are removed on exit. The same command runs
+on pull requests; no external provider accounts or secrets are needed.
+This covers one real provider, not formal OpenID Connect conformance.
 
 ## 9. Parity Status (vs. `temp/openid` and `temp/openidconnect-rs`)
 

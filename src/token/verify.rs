@@ -288,15 +288,23 @@ fn check_refresh_continuity(original: &JwtClaims, refreshed: &JwtClaims) -> Resu
     Ok(())
 }
 
-/// Looks up the signing key via `AsyncHttpsJwks::select_verification_key`.
-/// Refreshes the JWKS on `kid` miss and applies the algorithm-confusion
-/// guard (`kty`/curve matching via `VerificationJwkSelector`).
+/// Refreshes the JWKS on a `kid` miss. Without a `kid`, requires a unique
+/// candidate after applying the same key selection rules.
 pub(crate) async fn resolve_key(
     jwks: &AsyncHttpsJwks,
     kid: Option<&str>,
     alg: &str,
 ) -> Result<JsonWebKey, OidcError> {
-    let key = jwks.select_verification_key(kid, alg).await?;
+    let key = if kid.is_some() {
+        jwks.select_verification_key(kid, alg).await?
+    } else {
+        let keys = jwks.keys_with_refresh(None).await?;
+        let candidates = jose4rs::jwk::VerificationJwkSelector::new().select_list(None, alg, &keys);
+        match candidates.as_slice() {
+            [key] => Some((*key).clone()),
+            _ => None,
+        }
+    };
     key.ok_or_else(|| OidcError::NoMatchingJwk {
         kid: kid.map(str::to_owned),
         alg: alg.to_owned(),
@@ -558,19 +566,15 @@ mod tests {
         (priv_key, jwk)
     }
 
-    /// Wraps a single `JsonWebKey` in a JWKS body suitable for the
-    /// mock fetcher. Patches in `kid` and `alg` because jose4rs does
-    /// not expose public setters for those on `RsaJsonWebKey`.
-    fn jwks_body(jwk: &JsonWebKey) -> Vec<u8> {
-        let set = JsonWebKeySet::from_keys(vec![jwk.clone()]);
+    /// Builds a JWKS body with explicit signing metadata for the mock fetcher.
+    fn jwks_body(keys: &[JsonWebKey]) -> Vec<u8> {
+        let set = JsonWebKeySet::from_keys(keys.to_vec());
         let mut json: serde_json::Value =
             serde_json::from_str(&set.to_json(jose4rs::jwk::OutputControlLevel::PublicOnly))
                 .unwrap();
-        // Patch the only key with kid/alg/use/kty.
         if let Some(keys) = json.get_mut("keys").and_then(|k| k.as_array_mut()) {
             for k in keys.iter_mut() {
                 if let Some(obj) = k.as_object_mut() {
-                    obj.insert("kid".into(), json!(KID));
                     obj.insert("alg".into(), json!("RS256"));
                     obj.insert("use".into(), json!("sig"));
                     // Ensure kty is set; jose4rs usually does this.
@@ -595,17 +599,29 @@ mod tests {
     }
 
     fn build_jwks(jwk: &JsonWebKey) -> AsyncHttpsJwks {
+        build_jwks_from_keys(std::slice::from_ref(jwk))
+    }
+
+    fn build_jwks_from_keys(keys: &[JsonWebKey]) -> AsyncHttpsJwks {
         let fetcher: Arc<dyn AsyncJwksFetcher> = Arc::new(StaticJwks {
-            body: jwks_body(jwk),
+            body: jwks_body(keys),
         });
         AsyncHttpsJwks::new("https://idp.example.com/jwks", fetcher)
     }
 
     fn sign_id_token(priv_key: &RsaPrivateKey, claims: &serde_json::Value) -> String {
+        sign_id_token_with_kid(priv_key, claims, Some(KID))
+    }
+
+    fn sign_id_token_with_kid(
+        priv_key: &RsaPrivateKey,
+        claims: &serde_json::Value,
+        kid: Option<&str>,
+    ) -> String {
         let pem = priv_key.to_pkcs8_pem(LineEnding::LF).expect("priv pem");
         let key = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("enc key");
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(KID.to_owned());
+        header.kid = kid.map(str::to_owned);
         encode(&header, claims, &key).expect("encode")
     }
 
@@ -638,6 +654,42 @@ mod tests {
         let ctx = VerifyContext::default();
         let parsed = verifier().verify(&token, &jwks, &ctx).await.unwrap();
         assert_eq!(parsed.subject().unwrap(), "user-42");
+    }
+
+    #[tokio::test]
+    async fn token_without_kid_requires_one_eligible_key() -> Result<(), OidcError> {
+        let (signing_key, signing_jwk) = make_keypair();
+        let (_, mut other_jwk) = make_keypair();
+        other_jwk.set_key_id("test-key-2");
+        let issued_at = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "sub": "user-42",
+            "exp": issued_at + 3600,
+            "iat": issued_at,
+        });
+        let token = IdToken::parse(sign_id_token_with_kid(&signing_key, &claims, None))?;
+        let verifier = verifier();
+        let context = VerifyContext::default();
+        let verified = verifier
+            .verify(&token, &build_jwks(&signing_jwk), &context)
+            .await?;
+        assert_eq!(verified.subject(), Some("user-42"));
+
+        for keys in [
+            [signing_jwk.clone(), other_jwk.clone()],
+            [other_jwk, signing_jwk],
+        ] {
+            let result = verifier
+                .verify(&token, &build_jwks_from_keys(&keys), &context)
+                .await;
+            assert!(matches!(
+                result,
+                Err(OidcError::NoMatchingJwk { kid: None, .. })
+            ));
+        }
+        Ok(())
     }
 
     #[tokio::test]
