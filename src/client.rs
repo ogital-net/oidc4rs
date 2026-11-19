@@ -14,6 +14,7 @@ use crate::flow::token::{
 };
 use crate::metadata::{CachePolicy, ProviderMetadata};
 use crate::token::response::{IdToken, TokenResponse};
+use crate::token::userinfo::{UserInfo, UserInfoVerifier};
 use crate::token::verify::{DEFAULT_ALLOWED_ALGS, IdTokenVerifier};
 use crate::transport::http::{AsyncHttpClient, HttpMethod, HttpRequest};
 use crate::transport::kv::AsyncKvStore;
@@ -40,6 +41,7 @@ pub struct Client {
     pub(crate) client_secret: Option<ClientSecret>,
     token_auth_method: Option<TokenAuthMethod>,
     id_token_signing_alg: &'static str,
+    userinfo_signing_alg: Option<&'static str>,
     pub(crate) http: Arc<dyn AsyncHttpClient>,
 }
 
@@ -150,6 +152,7 @@ impl Client {
             client_secret,
             token_auth_method: None,
             id_token_signing_alg: "RS256",
+            userinfo_signing_alg: None,
             http,
         })
     }
@@ -187,6 +190,7 @@ impl Client {
             client_secret,
             token_auth_method: None,
             id_token_signing_alg: "RS256",
+            userinfo_signing_alg: None,
             http,
         })
     }
@@ -593,28 +597,30 @@ impl Client {
         )
     }
 
-    /// Fetches the OIDC userinfo claims for `access_token`.
+    /// Requires signed UserInfo using the `userinfo_signed_response_alg`
+    /// registered for this client. Only supported asymmetric signing
+    /// algorithms can be configured.
+    pub fn with_userinfo_signing_alg(mut self, alg: &str) -> Result<Self, OidcError> {
+        self.userinfo_signing_alg = Some(registered_signing_alg(alg)?);
+        Ok(self)
+    }
+
+    /// Fetches the OIDC UserInfo claims for `access_token` and requires the
+    /// returned subject to match the verified ID token's subject.
     ///
-    /// Sends a GET to the OP userinfo endpoint with
-    /// `Authorization: Bearer <token>` and
-    /// `Accept: application/json, application/jwt;q=0.9`. The
-    /// response format is selected by the OP's `Content-Type`
-    /// header:
+    /// By default, accepts JSON or a JWT signed with a supported algorithm
+    /// from discovery. If [`with_userinfo_signing_alg`](Self::with_userinfo_signing_alg)
+    /// was used, requests and requires a JWT signed with the registered
+    /// algorithm. JWT responses are checked for signature, issuer, and audience.
     ///
-    /// - `application/json` -- claims parsed directly into
-    ///   [`UserInfo`].
-    /// - `application/jwt` -- a signed JWT. Signature, issuer,
-    ///   audience, and the provider's UserInfo algorithm policy are
-    ///   enforced.
-    ///
-    /// OIDC Core 1.0 section 5.4. The endpoint URL comes from
+    /// OIDC Core 1.0 section 5.3. The endpoint URL comes from
     /// `metadata.userinfo_endpoint`; returns an error if the OP
     /// did not advertise one.
     pub async fn fetch_userinfo(
         &self,
         access_token: &AccessToken,
         expected_subject: &str,
-    ) -> Result<crate::token::userinfo::UserInfo, OidcError> {
+    ) -> Result<UserInfo, OidcError> {
         self.refresh_metadata_if_stale().await?;
         let provider = self.provider();
         let endpoint = provider
@@ -624,14 +630,16 @@ impl Client {
             .ok_or_else(|| {
                 OidcError::InvalidMetadata("provider metadata missing userinfo_endpoint".into())
             })?;
+        let accept = if self.userinfo_signing_alg.is_some() {
+            "application/jwt"
+        } else {
+            "application/json, application/jwt;q=0.9"
+        };
         let req = HttpRequest {
             method: HttpMethod::Get,
             url: endpoint.as_url().to_string(),
             headers: vec![
-                (
-                    "Accept".into(),
-                    "application/json, application/jwt;q=0.9".into(),
-                ),
+                ("Accept".into(), accept.into()),
                 (
                     "Authorization".into(),
                     format!("Bearer {}", access_token.as_str()),
@@ -648,20 +656,31 @@ impl Client {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map_or("application/json", |(_, v)| v.as_str());
-        let userinfo = if content_type_essence_is(content_type, "application/jwt") {
+        let is_jwt = content_type_essence_is(content_type, "application/jwt");
+        if self.userinfo_signing_alg.is_some() && !is_jwt {
+            return Err(OidcError::InvalidAuthorizationRequest(
+                "signed UserInfo requires application/jwt".into(),
+            ));
+        }
+        let userinfo = if is_jwt {
             let compact = std::str::from_utf8(&resp.body).map_err(|_| {
                 OidcError::InvalidAuthorizationRequest(
                     "userinfo JWT body is not valid UTF-8".into(),
                 )
             })?;
-            let verifier = crate::token::userinfo::UserInfoVerifier::from_metadata(
-                &provider.metadata,
-                self.client_id.as_str(),
-            );
-            crate::token::userinfo::UserInfo::from_signed_jwt(compact, &verifier, &provider.jwks)
-                .await?
+            let verifier = match self.userinfo_signing_alg {
+                Some(alg) => UserInfoVerifier::new(
+                    provider.metadata.issuer.as_str(),
+                    self.client_id.as_str(),
+                )
+                .with_allowed_algs([alg.to_owned()]),
+                None => {
+                    UserInfoVerifier::from_metadata(&provider.metadata, self.client_id.as_str())
+                }
+            };
+            UserInfo::from_signed_jwt(compact, &verifier, &provider.jwks).await?
         } else if content_type_essence_is(content_type, "application/json") {
-            crate::token::userinfo::UserInfo::from_json(&resp.body)?
+            UserInfo::from_json(&resp.body)?
         } else {
             return Err(OidcError::InvalidAuthorizationRequest(format!(
                 "unexpected userinfo Content-Type: {content_type:?}"
@@ -691,11 +710,7 @@ impl Client {
     /// The default is `RS256`. Only supported asymmetric signing algorithms
     /// can be configured.
     pub fn with_id_token_signing_alg(mut self, alg: &str) -> Result<Self, OidcError> {
-        self.id_token_signing_alg = DEFAULT_ALLOWED_ALGS
-            .iter()
-            .copied()
-            .find(|supported| *supported == alg)
-            .ok_or_else(|| OidcError::UnsupportedAlgorithm(alg.to_owned()))?;
+        self.id_token_signing_alg = registered_signing_alg(alg)?;
         Ok(self)
     }
 
@@ -728,6 +743,14 @@ impl Client {
     pub fn build_end_session_url(&self) -> crate::flow::logout::EndSessionUrlBuilder<'_> {
         crate::flow::logout::EndSessionUrlBuilder::new(self)
     }
+}
+
+fn registered_signing_alg(alg: &str) -> Result<&'static str, OidcError> {
+    DEFAULT_ALLOWED_ALGS
+        .iter()
+        .copied()
+        .find(|supported| *supported == alg)
+        .ok_or_else(|| OidcError::UnsupportedAlgorithm(alg.to_owned()))
 }
 
 async fn take_pending_request(
@@ -2356,6 +2379,38 @@ mod tests {
         assert_eq!(info.sub, "user-1");
         assert_eq!(info.email.as_deref(), Some("user@example.com"));
         assert_eq!(info.email_verified, Some(true));
+    }
+
+    #[tokio::test]
+    async fn fetch_userinfo_requires_jwt_when_registered_for_signed_responses() {
+        let http = Arc::new(MockHttp::new(vec![HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"sub":"user-1"}"#.to_vec(),
+        }]));
+        let client = Client::from_parts(
+            provider_metadata_with_userinfo(),
+            ClientId::new("client").unwrap(),
+            None,
+            http.clone(),
+        )
+        .unwrap()
+        .with_userinfo_signing_alg("RS256")
+        .unwrap();
+
+        let error = client
+            .fetch_userinfo(&AccessToken::new("token").unwrap(), "user-1")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("signed UserInfo requires application/jwt")
+        );
+        let request = http.last_request.lock().unwrap().take().unwrap();
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept") && value == "application/jwt"
+        }));
     }
 
     #[tokio::test]
