@@ -1,14 +1,14 @@
 //! ID-token verification.
 //!
 //! Implements every check in SPEC §5:
-//! - signature via `JsonWebSignature::verify_signature(&key)`
+//! - signature via `JsonWebSignature::payload(&key)`
 //! - `alg` against the verifier's allow-list
 //! - `iss`, `aud`, `exp`, `iat`, `nbf` via `JwtConsumer`
 //! - additional `aud` values must be explicitly trusted
 //! - `azp` rule: when `aud` has multiple values, `azp` must equal the
 //!   configured client id
 //! - `nonce` matches the second-leg state (caller supplies it)
-//! - `at_hash` over the access token (caller supplies it; hybrid flow)
+//! - `at_hash` over the access token when the claim is present
 //! - `auth_time` freshness when the request used `max_age`
 //! - JWKS `kid` lookup with refresh on miss (combined with alg
 //!   filtering via `AsyncHttpsJwks::select_verification_key`)
@@ -16,27 +16,25 @@
 use std::time::Duration;
 
 use jose4rs::error::JoseError;
+use jose4rs::jwa::{AlgorithmConstraints, ConstraintType};
 use jose4rs::jwk::{AsyncHttpsJwks, JsonWebKey};
 use jose4rs::jws::{AlgorithmIdentifier, JsonWebSignature};
-use jose4rs::jwt::{JwtClaims, JwtConsumerBuilder};
+use jose4rs::jwt::{InvalidJwtError, JwtClaims, JwtConsumerBuilder};
 use jose4rs::jwx::{HeaderParameter, JsonWebStructure as _};
 
 use crate::error::OidcError;
 use crate::metadata::ProviderMetadata;
-use crate::token::response::{IdToken, TokenResponse};
+use crate::token::response::{IdToken, TokenResponse, parse_id_token_jws};
 
 /// Context the caller supplies per verification.
 #[derive(Debug, Clone, Default)]
 pub struct VerifyContext {
     /// Expected `nonce` claim. Set from the second-leg pending entry.
     pub expected_nonce: Option<String>,
-    /// Access token to validate the `at_hash` claim against. Only
-    /// required for the OIDC hybrid flow; leave `None` otherwise.
+    /// Access token to validate `at_hash` against when the claim is present.
     pub access_token: Option<String>,
-    /// Client id used as the `azp` value when `aud` is multi-valued.
-    pub client_id: Option<String>,
-    /// Clock skew to apply to `exp`, `iat`, `nbf`, and `auth_time`
-    /// checks. Defaults to zero.
+    /// Clock skew to apply to `exp`, `nbf`, and `auth_time` checks.
+    /// Defaults to zero.
     pub clock_skew: Option<Duration>,
     /// Requested `max_age`. When set, the ID token must contain a
     /// valid `auth_time`. A zero value requires fresh authentication
@@ -53,9 +51,10 @@ pub struct VerifyContext {
 /// require a shared secret distribution the RP cannot assume.
 pub const DEFAULT_ALLOWED_ALGS: &[&str] = &[
     "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA",
+    "Ed25519",
 ];
 
-/// Algorithms that must never seed an ID-token or UserInfo allow-list:
+/// Algorithms this RP does not accept for ID tokens or signed UserInfo:
 /// `none` (unsecured JWS) and the HS* family (symmetric; this RP has no
 /// path to supply the shared secret as a verification key).
 pub(crate) fn is_forbidden_alg(alg: &str) -> bool {
@@ -69,30 +68,29 @@ pub struct IdTokenVerifier {
     expected_audience: String,
     trusted_additional_audiences: Vec<String>,
     allowed_algs: Vec<String>,
+    algorithm_constraints: AlgorithmConstraints<AlgorithmIdentifier>,
+    issued_at_window: Option<(Duration, Duration)>,
 }
 
 impl IdTokenVerifier {
-    /// Builds a verifier with the OIDC Core 1.0 default
-    /// `id_token` allow-list. Use [`IdTokenVerifier::from_metadata`]
-    /// when the relying party has access to a discovery document;
-    /// it narrows the list to the algorithms the OP actually
-    /// advertises.
+    /// Builds a standalone verifier with the supported asymmetric algorithm
+    /// allow-list. Use [`crate::Client::verifier`] for the registered algorithm
+    /// or configure it explicitly with [`Self::with_allowed_algs`].
     pub fn new(expected_issuer: impl Into<String>, expected_audience: impl Into<String>) -> Self {
-        Self {
-            expected_issuer: expected_issuer.into(),
-            expected_audience: expected_audience.into(),
-            trusted_additional_audiences: Vec::new(),
-            allowed_algs: DEFAULT_ALLOWED_ALGS
+        Self::with_policy(
+            expected_issuer.into(),
+            expected_audience.into(),
+            DEFAULT_ALLOWED_ALGS
                 .iter()
-                .map(|s| (*s).to_owned())
+                .map(|alg| (*alg).to_owned())
                 .collect(),
-        }
+        )
     }
 
-    /// Builds a verifier whose allow-list is sourced from the OP's
-    /// discovery document, closing the algorithm-confusion gap that
-    /// comes from a default-permissive verifier accepting any Core
-    /// `alg` the OP happens to rotate to.
+    /// Opts in to the asymmetric algorithms advertised by the provider.
+    /// Discovery describes provider capabilities, not the algorithm negotiated
+    /// for a particular client. Use [`crate::Client::verifier`] to enforce a
+    /// registered algorithm (or the OIDC default of `RS256`).
     ///
     /// `audience` is the relying party's client id (the `aud` value
     /// the OP is expected to put in the ID token).
@@ -100,26 +98,59 @@ impl IdTokenVerifier {
     /// The expected issuer preserves the exact `metadata.issuer`
     /// serialization because OIDC requires a byte-for-byte match.
     pub fn from_metadata(metadata: &ProviderMetadata, audience: impl Into<String>) -> Self {
-        Self {
-            expected_issuer: metadata.issuer.as_str().to_owned(),
-            expected_audience: audience.into(),
-            trusted_additional_audiences: Vec::new(),
-            allowed_algs: metadata
+        Self::with_policy(
+            metadata.issuer.as_str().to_owned(),
+            audience.into(),
+            metadata
                 .id_token_signing_alg_values_supported
                 .iter()
                 .filter(|alg| !is_forbidden_alg(alg))
                 .cloned()
                 .collect(),
+        )
+    }
+
+    fn with_policy(
+        expected_issuer: String,
+        expected_audience: String,
+        allowed_algs: Vec<String>,
+    ) -> Self {
+        let algorithm_constraints = permit_algorithms(&allowed_algs);
+        Self {
+            expected_issuer,
+            expected_audience,
+            trusted_additional_audiences: Vec::new(),
+            allowed_algs,
+            algorithm_constraints,
+            issued_at_window: None,
         }
     }
 
+    /// Adds an algorithm to the configured allow-list. Only supported
+    /// asymmetric algorithms can be used to verify a token.
     pub fn allow_alg(mut self, alg: impl Into<String>) -> Self {
         self.allowed_algs.push(alg.into());
+        self.algorithm_constraints = permit_algorithms(&self.allowed_algs);
         self
     }
 
+    /// Replaces the configured allow-list. Only supported asymmetric algorithms
+    /// can be used to verify a token.
     pub fn with_allowed_algs(mut self, algs: impl IntoIterator<Item = String>) -> Self {
         self.allowed_algs = algs.into_iter().collect();
+        self.algorithm_constraints = permit_algorithms(&self.allowed_algs);
+        self
+    }
+
+    /// Bounds `iat` relative to the current time, with whole-second precision.
+    /// By default there is no age limit. `VerifyContext::clock_skew` is not
+    /// added to these bounds; include any desired leeway here.
+    pub fn with_issued_at_window(
+        mut self,
+        allowed_future: Duration,
+        allowed_past: Duration,
+    ) -> Self {
+        self.issued_at_window = Some((allowed_future, allowed_past));
         self
     }
 
@@ -149,20 +180,32 @@ impl IdTokenVerifier {
         &self.allowed_algs
     }
 
-    /// Verifies `token` end-to-end. Looks the signing key up in
-    /// `jwks`, refreshing the JWKS on unknown `kid`. All checks in
-    /// SPEC §5 are enforced.
+    /// Verifies the raw serialization of `token`, ignoring its cached claims
+    /// and headers. See [`Self::verify_compact`] for the JWKS trust requirement.
     pub async fn verify(
         &self,
         token: &IdToken,
         jwks: &AsyncHttpsJwks,
         ctx: &VerifyContext,
     ) -> Result<JwtClaims, OidcError> {
-        let jws = JsonWebSignature::from_compact_serialization(&token.raw)?;
+        self.verify_compact(&token.raw, jwks, ctx).await
+    }
+
+    /// Verifies a compact ID token end-to-end, refreshing the JWKS on an unknown
+    /// `kid`. Claims are parsed only after signature verification succeeds.
+    ///
+    /// `jwks` must come from the trusted configuration for this verifier's
+    /// issuer. Matching the `iss` claim does not establish that trust.
+    pub async fn verify_compact(
+        &self,
+        raw: &str,
+        jwks: &AsyncHttpsJwks,
+        ctx: &VerifyContext,
+    ) -> Result<JwtClaims, OidcError> {
+        let mut jws = parse_id_token_jws(raw)?;
+        jws.set_algorithm_constraints(&self.algorithm_constraints);
         let alg = jws.algorithm().unwrap_or("");
-        self.check_alg(alg)?;
-        let alg_id = AlgorithmIdentifier::try_from(alg)
-            .map_err(|e: JoseError| OidcError::UnsupportedAlgorithm(e.to_string()))?;
+        let alg_id = self.check_alg(alg)?;
 
         // 2. JWKS lookup with refresh on unknown kid.
         let key = resolve_key(jwks, jws.header(HeaderParameter::KeyId), alg).await?;
@@ -173,7 +216,6 @@ impl IdTokenVerifier {
         // 5. Additional audiences and azp.
         check_azp(
             &claims,
-            ctx,
             &self.expected_audience,
             &self.trusted_additional_audiences,
         )?;
@@ -205,29 +247,32 @@ impl IdTokenVerifier {
         let Some(raw) = response.id_token() else {
             return Ok(None);
         };
-        let token = IdToken::parse(raw)?;
         let context = VerifyContext {
             access_token: Some(response.access_token.as_str().to_owned()),
             ..VerifyContext::default()
         };
-        let refreshed = self.verify(&token, jwks, &context).await?;
+        let refreshed = self.verify_compact(raw, jwks, &context).await?;
         check_refresh_continuity(original, &refreshed)?;
         Ok(Some(refreshed))
     }
 
-    fn check_alg(&self, alg: &str) -> Result<(), OidcError> {
-        // `none` is never acceptable, even if a caller widened the
-        // allow-list: an unsecured JWS carries no signature to verify.
-        if alg.eq_ignore_ascii_case("none") {
-            return Err(OidcError::UnsupportedAlgorithm(
-                "the `none` algorithm is never accepted for ID tokens".into(),
-            ));
-        }
-        if !self.allowed_algs.iter().any(|a| a == alg) {
+    fn check_alg(&self, alg: &str) -> Result<AlgorithmIdentifier, OidcError> {
+        if is_forbidden_alg(alg) || !self.allowed_algs.iter().any(|allowed| allowed == alg) {
             return Err(OidcError::UnsupportedAlgorithm(alg.to_owned()));
         }
-        Ok(())
+        AlgorithmIdentifier::try_from(alg)
+            .map_err(|error| OidcError::UnsupportedAlgorithm(error.to_string()))
     }
+}
+
+fn permit_algorithms(allowed_algs: &[String]) -> AlgorithmConstraints<AlgorithmIdentifier> {
+    let supported: Vec<_> = allowed_algs
+        .iter()
+        .map(String::as_str)
+        .filter(|alg| !is_forbidden_alg(alg))
+        .filter_map(|alg| AlgorithmIdentifier::try_from(alg).ok())
+        .collect();
+    AlgorithmConstraints::new(ConstraintType::Permit, supported)
 }
 
 fn refresh_claim_mismatch(claim: &str) -> OidcError {
@@ -319,17 +364,13 @@ fn verify_signature_and_claims(
     key: &JsonWebKey,
     ctx: &VerifyContext,
 ) -> Result<JwtClaims, OidcError> {
-    if !jws.verify_signature(key)? {
-        return Err(OidcError::InvalidIdToken(
-            jose4rs::jwt::InvalidJwtError::new("JWS signature is invalid"),
-        ));
-    }
-    let payload_bytes = jws.payload(key).map_err(OidcError::Jose)?;
-    let payload_str = std::str::from_utf8(payload_bytes).map_err(|_| {
-        OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(
-            "JWT payload is not valid UTF-8",
-        ))
+    let payload_bytes = jws.payload(key).map_err(|error| match error {
+        JoseError::IntegrityError(message) => {
+            OidcError::InvalidIdToken(jose4rs::jwt::InvalidJwtError::new(message))
+        }
+        error => OidcError::Jose(error),
     })?;
+    let claims = JwtClaims::parse(payload_bytes).map_err(InvalidJwtError::from)?;
     let mut builder = JwtConsumerBuilder::new()
         .set_expected_issuer(&verifier.expected_issuer)
         .set_expected_audience(true, false, &[verifier.expected_audience.as_str()])
@@ -339,18 +380,19 @@ fn verify_signature_and_claims(
     if let Some(skew) = ctx.clock_skew {
         builder = builder.set_allowed_clock_skew(skew);
     }
-    builder
-        .build()
-        .process_to_claims(payload_str)
-        .map_err(Into::into)
+    if let Some((allowed_future, allowed_past)) = verifier.issued_at_window {
+        builder = builder.set_issued_at_restrictions(
+            i64::try_from(allowed_future.as_secs()).unwrap_or(i64::MAX),
+            i64::try_from(allowed_past.as_secs()).unwrap_or(i64::MAX),
+        );
+    }
+    builder.build().validate(&claims)?;
+    Ok(claims)
 }
 
-/// Enforces audience trust and the azp rules from OIDC Core 1.0 section 3.1.3.7: azp is
-/// required when `aud` is multi-valued, and whenever azp is present it
-/// must equal the relying party's client id.
+/// Enforces OIDC audience trust and this verifier's strict `azp` policy.
 fn check_azp(
     claims: &JwtClaims,
-    ctx: &VerifyContext,
     expected_audience: &str,
     trusted_additional_audiences: &[String],
 ) -> Result<(), OidcError> {
@@ -365,19 +407,19 @@ fn check_azp(
             jose4rs::jwt::InvalidJwtError::new("aud contains an untrusted additional audience"),
         ));
     }
-    let azp = claims.string_claim("azp");
-    if audiences.len() > 1 && azp.is_none() {
-        return Err(OidcError::InvalidIdToken(
-            jose4rs::jwt::InvalidJwtError::new("azp claim required when aud has multiple values"),
-        ));
-    }
-    let Some(azp) = azp else {
+    let Some(azp) = claims.string_claim("azp") else {
+        if claims.has_claim("azp") {
+            return Err(jose4rs::jwt::InvalidJwtError::new("azp must be a string").into());
+        }
+        if audiences.len() > 1 {
+            return Err(jose4rs::jwt::InvalidJwtError::new(
+                "azp claim required when aud has multiple values",
+            )
+            .into());
+        }
         return Ok(());
     };
-    // The client id is the expected audience; ctx.client_id overrides
-    // it only when the caller supplies a different value.
-    let expected = ctx.client_id.as_deref().unwrap_or(expected_audience);
-    if azp != expected {
+    if azp != expected_audience {
         return Err(OidcError::InvalidIdToken(
             jose4rs::jwt::InvalidJwtError::new("azp does not match client_id"),
         ));
@@ -476,6 +518,9 @@ fn check_at_hash(
     key: &JsonWebKey,
 ) -> Result<(), OidcError> {
     let Some(at_hash_b64) = claims.string_claim("at_hash") else {
+        if claims.has_claim("at_hash") {
+            return Err(jose4rs::jwt::InvalidJwtError::new("at_hash must be a string").into());
+        }
         return Ok(());
     };
     let access_token = ctx.access_token.as_deref().ok_or_else(|| {
@@ -519,7 +564,8 @@ fn calculate_at_hash(
         AlgorithmIdentifier::HmacSha512
         | AlgorithmIdentifier::RsaUsingSha512
         | AlgorithmIdentifier::EcdsaUsingP521CurveAndSha512
-        | AlgorithmIdentifier::RsaPssUsingSha512 => {
+        | AlgorithmIdentifier::RsaPssUsingSha512
+        | AlgorithmIdentifier::Ed25519 => {
             let digest = crate::crypto::sha512(token);
             base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
@@ -527,7 +573,7 @@ fn calculate_at_hash(
             let digest = crate::crypto::sha512(token);
             base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2])
         }
-        AlgorithmIdentifier::None | AlgorithmIdentifier::EdDsa => {
+        _ => {
             return Err(OidcError::UnsupportedAlgorithm(format!(
                 "{} does not identify an at_hash digest",
                 alg_id.name()
@@ -542,7 +588,9 @@ mod tests {
     use super::*;
     use crate::metadata::ProviderMetadata;
     use crate::types::{AuthUrl, IssuerUrl, JwksUrl, TokenUrl};
-    use jose4rs::jwk::{AsyncJwksFetcher, FetchResponse, JsonWebKey, JsonWebKeySet};
+    use jose4rs::jwk::{
+        AsyncJwksFetcher, FetchResponse, JsonWebKey, JsonWebKeyGenerator, JsonWebKeySet,
+    };
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
@@ -575,7 +623,7 @@ mod tests {
         if let Some(keys) = json.get_mut("keys").and_then(|k| k.as_array_mut()) {
             for k in keys.iter_mut() {
                 if let Some(obj) = k.as_object_mut() {
-                    obj.insert("alg".into(), json!("RS256"));
+                    obj.entry("alg").or_insert_with(|| json!("RS256"));
                     obj.insert("use".into(), json!("sig"));
                     // Ensure kty is set; jose4rs usually does this.
                     if !obj.contains_key("kty") {
@@ -638,6 +686,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_unencoded_jwt_payloads() {
+        let protected = base64_simd::URL_SAFE_NO_PAD
+            .encode_to_string(br#"{"alg":"RS256","b64":false,"crit":["b64"]}"#);
+        let token = format!("{protected}.{{}}.");
+        assert!(JsonWebSignature::from_compact_serialization(&token).is_ok());
+        assert!(matches!(
+            IdToken::parse(&token),
+            Err(JoseError::InvalidHeader(_))
+        ));
+
+        let result = verifier()
+            .verify_compact(
+                &token,
+                &build_jwks_from_keys(&[]),
+                &VerifyContext::default(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(OidcError::Jose(JoseError::InvalidHeader(_)))
+        ));
+    }
+
+    #[tokio::test]
     async fn verifies_well_formed_token() {
         let (priv_key, jwk) = make_keypair();
         let iat = now();
@@ -654,6 +726,79 @@ mod tests {
         let ctx = VerifyContext::default();
         let parsed = verifier().verify(&token, &jwks, &ctx).await.unwrap();
         assert_eq!(parsed.subject().unwrap(), "user-42");
+    }
+
+    #[tokio::test]
+    async fn applies_the_issued_at_window_only_when_configured() {
+        let (priv_key, jwk) = make_keypair();
+        let jwks = build_jwks(&jwk);
+        let ctx = VerifyContext::default();
+        let unrestricted = verifier();
+        let restricted =
+            verifier().with_issued_at_window(Duration::from_secs(60), Duration::from_secs(60));
+        let current_time = now();
+        for offset in [-3600, 0, 3600] {
+            let claims = json!({
+                "iss": "https://idp.example.com",
+                "aud": "my-client",
+                "sub": "user-42",
+                "exp": current_time + 7200,
+                "iat": current_time + offset,
+            });
+            let token = sign_id_token(&priv_key, &claims);
+            unrestricted
+                .verify_compact(&token, &jwks, &ctx)
+                .await
+                .unwrap();
+            let result = restricted.verify_compact(&token, &jwks, &ctx).await;
+            if offset == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(OidcError::InvalidIdToken(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verifies_ed25519_with_at_hash_under_the_exact_algorithm_policy() {
+        let alg = AlgorithmIdentifier::Ed25519;
+        let mut key = JsonWebKeyGenerator::for_signature(alg).generate().unwrap();
+        key.set_key_id(KID);
+        let access_token = "AT-ED25519";
+        let digest = sha2::Sha512::digest(access_token.as_bytes());
+        let at_hash = base64_simd::URL_SAFE_NO_PAD.encode_to_string(&digest[..digest.len() / 2]);
+        let iat = now();
+        let mut jws = JsonWebSignature::new();
+        jws.set_algorithm(alg);
+        jws.set_header(HeaderParameter::KeyId, KID);
+        jws.set_payload(
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "my-client",
+                "sub": "user-42",
+                "exp": iat + 3600,
+                "iat": iat,
+                "at_hash": at_hash,
+            })
+            .to_string(),
+        );
+        let token = jws.compact_serialization(&key).unwrap();
+        let jwks = build_jwks(&key);
+        let ctx = VerifyContext {
+            access_token: Some(access_token.to_owned()),
+            ..Default::default()
+        };
+        let verified = verifier()
+            .with_allowed_algs(["Ed25519".to_owned()])
+            .verify_compact(&token, &jwks, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(verified.subject(), Some("user-42"));
+        let result = verifier()
+            .with_allowed_algs(["EdDSA".to_owned()])
+            .verify_compact(&token, &jwks, &ctx)
+            .await;
+        assert!(matches!(result, Err(OidcError::UnsupportedAlgorithm(_))));
     }
 
     #[tokio::test]
@@ -1068,6 +1213,10 @@ mod tests {
             encode_left(&sha512)
         );
         assert_eq!(
+            calculate_at_hash(access_token, AlgorithmIdentifier::Ed25519, None).unwrap(),
+            encode_left(&sha512)
+        );
+        assert_eq!(
             calculate_at_hash(access_token, AlgorithmIdentifier::EdDsa, Some("Ed25519")).unwrap(),
             encode_left(&sha512)
         );
@@ -1189,11 +1338,17 @@ mod tests {
     }
 
     #[test]
-    fn check_alg_hard_rejects_none_even_when_allowlisted() {
-        let v = IdTokenVerifier::new("https://idp.example.com", "my-client")
-            .with_allowed_algs(vec!["none".to_owned()]);
-        let err = v.check_alg("none").unwrap_err();
-        assert!(matches!(err, OidcError::UnsupportedAlgorithm(_)));
+    fn check_alg_rejects_unsecured_and_symmetric_algs_even_when_allowlisted() {
+        let verifier = verifier()
+            .with_allowed_algs(["none".to_owned(), "HS256".to_owned()])
+            .allow_alg("HS384")
+            .allow_alg("HS512");
+        for alg in ["none", "HS256", "HS384", "HS512"] {
+            assert!(matches!(
+                verifier.check_alg(alg),
+                Err(OidcError::UnsupportedAlgorithm(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1264,6 +1419,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OidcError::InvalidIdToken(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_present_non_string_azp_and_at_hash() {
+        let (priv_key, jwk) = make_keypair();
+        let jwks = build_jwks(&jwk);
+        let iat = now();
+        let claims = json!({
+            "iss": "https://idp.example.com",
+            "aud": "my-client",
+            "sub": "user-1",
+            "exp": iat + 3600,
+            "iat": iat,
+        });
+        for (claim, value) in [("azp", json!(null)), ("at_hash", json!(123))] {
+            let mut malformed = claims.clone();
+            malformed[claim] = value;
+            let token = IdToken::parse(sign_id_token(&priv_key, &malformed)).unwrap();
+            let err = verifier()
+                .verify(&token, &jwks, &VerifyContext::default())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, OidcError::InvalidIdToken(_)),
+                "{claim}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

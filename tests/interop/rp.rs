@@ -69,13 +69,7 @@ impl RelyingParty {
                     .client
                     .complete_authorization_from_pending(callback, pending)
                     .await?;
-                let claims = completed
-                    .verify_id_token(
-                        &self.client.verifier(),
-                        self.client.client_id().as_str(),
-                        &self.client.jwks(),
-                    )
-                    .await?;
+                let claims = completed.verify_id_token(&self.client).await?;
                 let subject = claims.subject().ok_or("missing verified subject")?;
                 let userinfo = self
                     .client

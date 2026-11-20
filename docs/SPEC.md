@@ -146,21 +146,22 @@ src/
 
 ## 5. Validation Responsibilities
 
-ID-token verification (in `token::verify::IdTokenVerifier::verify`):
+ID-token verification (in `token::verify::IdTokenVerifier::verify_compact`):
 
 | Check | Source of truth |
 |---|---|
-| Signature | `jose4rs::jws::JsonWebSignature::verify_signature` |
-| `alg` matches verifier's allowed list | verifier config |
+| Signature and authenticated payload | `jose4rs::jws::JsonWebSignature::payload` |
+| `alg` is supported, asymmetric, and allowlisted | verifier preflight and `jose4rs::jwa::AlgorithmConstraints` |
+| The payload uses the JWT encoding (`b64=false` is rejected) | RFC 7797 section 7 |
 | `iss` equals expected issuer | verifier config |
 | `aud` contains expected client id | verifier config |
-| `azp` equals client id if `aud` has multiple values | verifier config |
+| `azp` is required for multiple audiences and must equal the configured client id whenever present | verifier config |
 | Additional `aud` values must be explicitly trusted | `IdTokenVerifier::with_trusted_additional_audiences` |
 | `exp` is in the future (with configurable skew) | `JwtConsumerBuilder` |
-| `iat` is in the past (with configurable skew) | `JwtConsumerBuilder` |
+| `iat` is required; bounds are optional and separate from skew | `IdTokenVerifier::with_issued_at_window` and `JwtConsumerBuilder` |
 | `nbf` is in the past (with configurable skew) | `JwtConsumerBuilder` |
 | `nonce` matches second-leg state | second-leg flow |
-| `at_hash` (hybrid flow) | computed via `crypto::hash::sha256` |
+| `at_hash`, when present, is a string matching the access-token hash | digest selected by the JWS algorithm |
 | JWKS `kid` lookup | `jose4rs::jwk::VerificationJwkSelector` |
 | JWKS refresh on unknown `kid` | `jose4rs::jwk::AsyncHttpsJwks` |
 
@@ -280,7 +281,7 @@ children once their parent is done.
 
 - [x] `token::verify::IdTokenVerifier` with all checks in section 5
 - [x] `token::verify::IdTokenVerifier::verify` -- constant-time `nonce` comparison via `CRYPTO_memcmp` (see section 5 footnote)
-- [x] `IdTokenVerifier::from_metadata` narrows `allowed_algs` from `metadata.id_token_signing_alg_values_supported`; `Client::verifier()` is the convenience constructor (issuer from discovery, audience from `client_id`, trailing slash stripped from issuer so it compares byte-equal to the OP's `iss` claim)
+- [x] `Client::verifier()` pins the registered signing algorithm (default `RS256`), the exact discovery issuer, and the client ID. `CompleteAuthorization::verify_id_token(&client)` also uses that client's JWKS. `IdTokenVerifier::from_metadata` is a standalone opt-in to the provider's advertised algorithms.
 - [x] `Client::jwks()` exposes the per-Client `AsyncHttpsJwks` cache so resource-server code that verifies bearer JWT access tokens with `jose4rs` directly shares the same key fetches, `kid` lookups, and `Cache-Control` state. `AsyncHttpsJwks` and `AsyncJwksFetcher` are re-exported at the crate root for that purpose.
 - [x] `token::response::TokenResponse` with `AccessToken`, `RefreshToken`, `IdToken`
 - [ ] `token::response::TokenResponse` -- record `expires_in` as `Option<Instant>` for downstream refresh logic
@@ -374,7 +375,7 @@ Items below classify the gaps as **Add** (work pending for v1.1),
 | All SPEC section 5 checks | Already | Single call site in `IdTokenVerifier::verify` |
 | JWKS kid refresh on miss | Already | `AsyncHttpsJwks::select_verification_key` |
 | Constant-time nonce compare | Already | `crypto::ct::ct_equals` wrapping `CRYPTO_memcmp`; called from `check_nonce` |
-| Algorithm allow-list seeded from discovery | Already | `IdTokenVerifier::from_metadata` and `Client::verifier()` thread `metadata.id_token_signing_alg_values_supported`; `Some(empty)` is honored as "reject all" to surface misconfigured OPs loudly; `None` falls back to the OIDC Core default `id_token` `alg` set |
+| ID-token algorithm allow-list | Already | `Client::verifier()` pins the registered algorithm or `RS256`; `IdTokenVerifier::from_metadata` opts in to the provider's advertised asymmetric algorithms and an empty list rejects all |
 | Insecure verify (skip signature) | Defer | OpenSSF discourages; documentation only |
 
 ### 9.5 UserInfo
@@ -481,16 +482,10 @@ by impact and dependency order:
 6. **Auto-`sub` check** in `Client::fetch_userinfo`: compare the
    `sub` claim against the ID-token's `sub` when a verifier is
    supplied.
-7. **Algorithm allow-list from discovery**: `Client::discover`
-   auto-narrows `IdTokenVerifier::allowed_algs` to
-   `metadata.id_token_signing_alg_values_supported`. New convenience
-   constructor `Client::verifier()` that returns the narrowed
-   verifier. (Done -- `IdTokenVerifier::from_metadata` plus
-   `Client::verifier`; issuer pulled from discovery with the
-   trailing slash stripped so it byte-matches the OP's `iss`
-   claim; `Some(empty)` is honored as "reject every alg" to
-   surface a misconfigured OP, `None` falls back to
-   `DEFAULT_ALLOWED_ALGS`. Six new tests in `token::verify::tests`.)
+7. **ID-token algorithm policy**: `Client::verifier()` pins the
+  registered signing algorithm (default `RS256`) and preserves the exact
+  discovery issuer. Standalone verifiers may opt in to provider-advertised
+  algorithms through `IdTokenVerifier::from_metadata`.
 8. **`parse_authorization_response`** accepts either a query string
    or a leading-`#`-stripped fragment unchanged. SPEC §8.10
    snapshot tests added at the same time.

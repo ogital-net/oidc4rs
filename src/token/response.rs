@@ -99,14 +99,10 @@ impl IdToken {
     /// trusting any claim.
     pub fn parse(raw: impl Into<String>) -> Result<Self, JoseError> {
         let raw = raw.into();
-        let jws = JsonWebSignature::from_compact_serialization(&raw)?;
+        let jws = parse_id_token_jws(&raw)?;
         let alg = jws.algorithm().unwrap_or("").to_owned();
         let kid = jws.header(HeaderParameter::KeyId).map(str::to_owned);
-        // Use unverified_payload here; verification is the verifier's job.
-        let payload_bytes = jws.unverified_payload()?;
-        let claims_json = std::str::from_utf8(payload_bytes)
-            .map_err(|_| JoseError::MalformedToken("id_token payload is not UTF-8".into()))?;
-        let claims = JwtClaims::parse(claims_json)?;
+        let claims = JwtClaims::parse(jws.unverified_payload()?)?;
         Ok(Self {
             raw,
             claims,
@@ -114,6 +110,32 @@ impl IdToken {
             header_kid: kid,
         })
     }
+}
+
+/// Parses the compact JWS and enforces the JWT encoding rule from RFC 7797.
+pub(crate) fn parse_id_token_jws<'constraints>(
+    raw: &str,
+) -> Result<JsonWebSignature<'constraints>, JoseError> {
+    #[derive(Deserialize)]
+    struct EncodingHeader {
+        b64: Option<bool>,
+    }
+
+    let (protected, _) = raw.split_once('.').ok_or_else(|| {
+        JoseError::MalformedToken("missing JWS protected header separator".into())
+    })?;
+    let protected = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(protected)
+        .map_err(|error| {
+            JoseError::InvalidHeader(format!("invalid JWS protected header: {error}"))
+        })?;
+    let header: EncodingHeader = serde_json::from_slice(&protected).map_err(|error| {
+        JoseError::InvalidHeader(format!("invalid JWS protected header: {error}"))
+    })?;
+    if header.b64 == Some(false) {
+        return Err(JoseError::InvalidHeader("JWTs cannot use b64=false".into()));
+    }
+    JsonWebSignature::from_compact_serialization(raw)
 }
 
 impl TokenResponse {

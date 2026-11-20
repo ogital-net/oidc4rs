@@ -724,7 +724,7 @@ impl Client {
     /// Callers can further narrow or widen the list with
     /// `IdTokenVerifier::allow_alg` /
     /// `IdTokenVerifier::with_allowed_algs` before passing the
-    /// verifier to `verify` / `verify_id_token`.
+    /// verifier to `IdTokenVerifier::verify`.
     pub fn verifier(&self) -> IdTokenVerifier {
         let metadata = self.metadata();
         IdTokenVerifier::new(metadata.issuer.as_str(), self.client_id().as_str())
@@ -803,30 +803,27 @@ impl CompleteAuthorization {
         Ok(Some(id_token))
     }
 
-    /// Convenience: parse + verify the id_token in one call. Wires
-    /// the access token (for `at_hash`) and the second-leg nonce from
-    /// the pending request.
-    ///
-    /// `client_id` and `jwks` are taken from the calling `Client` via
-    /// the [`crate::token::verify::IdTokenVerifier`].
+    /// Verifies the returned ID token using the initiating client's issuer,
+    /// registered algorithm, and JWKS. Uses the nonce and `max_age` from the
+    /// pending request and the access token from the response.
     pub async fn verify_id_token(
         &self,
-        verifier: &crate::token::verify::IdTokenVerifier,
-        client_id: &str,
-        jwks: &jose4rs::jwk::AsyncHttpsJwks,
+        client: &Client,
     ) -> Result<jose4rs::jwt::JwtClaims, OidcError> {
-        let id_token = self.parse_id_token()?.ok_or_else(|| {
+        let raw = self.token_response.id_token().ok_or_else(|| {
             OidcError::InvalidAuthorizationRequest("no id_token in token_response".into())
         })?;
         let ctx = crate::token::verify::VerifyContext {
             expected_nonce: Some(self.pending.nonce.clone()),
             access_token: Some(self.token_response.access_token.as_str().to_owned()),
-            client_id: Some(client_id.to_owned()),
             clock_skew: None,
             expected_max_age: self.pending.max_age,
             authorization_started_at: Some(self.pending.created_at),
         };
-        verifier.verify(&id_token, jwks, &ctx).await
+        client
+            .verifier()
+            .verify_compact(raw, &client.jwks(), &ctx)
+            .await
     }
 }
 
